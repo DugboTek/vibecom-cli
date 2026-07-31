@@ -430,10 +430,20 @@ export function ensureGitignored(root: string): boolean {
 
 export class ApiError extends Error {}
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Retries 429 and 5xx with backoff.
+ *
+ * Linking is one request per project, so a machine with two dozen repos issues
+ * a burst by design. A transient limit should cost a few seconds, not abandon
+ * the project and print a wall of red.
+ */
 async function request<T>(
   origin: string,
   route: string,
-  init: RequestInit = {}
+  init: RequestInit = {},
+  attempt = 0
 ): Promise<T> {
   let res: Response;
   try {
@@ -441,6 +451,16 @@ async function request<T>(
   } catch {
     throw new ApiError(`could not reach ${origin}`);
   }
+
+  if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : 400 * 2 ** attempt;
+    await wait(Math.min(delay, 8000));
+    return request<T>(origin, route, init, attempt + 1);
+  }
+
   const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
     throw new ApiError(
