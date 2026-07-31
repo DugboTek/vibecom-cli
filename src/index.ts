@@ -709,6 +709,7 @@ async function help() {
     ["link [dir]", "connect projects under a directory"],
     ["preview", "show exactly what leaves this repo"],
     ["status", "linked projects and trusted owners"],
+    ["sync", "cover worktrees created since linking"],
     ["unlink", "stop collecting from this repo"],
     ["trust <owner>", "allow repos under an org you control"],
     ["logout", "remove stored credentials"],
@@ -749,6 +750,20 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.outro(pc.dim("no other shape exists"));
   },
   status: () => status(),
+  sync: async () => {
+    p.intro(gradient("  sync  "));
+    const healed = syncWorktrees();
+    if (healed.length === 0) {
+      p.log.success("every checkout is already reporting");
+    } else {
+      reportSync(healed);
+    }
+    p.outro(
+      pc.dim(
+        `${healed.reduce((n, h) => n + h.covered.length, 0)} checkout(s) covered`
+      )
+    );
+  },
   unlink: async () => {
     const cred = requireLogin();
     p.intro(gradient("  unlink  "));
