@@ -6,7 +6,13 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 import {
+  ensureExcluded,
   ensureGitignored,
+  gitRoot,
+  listWorktrees,
+  projectRoot,
+  readProjectToken,
+  uncoveredWorktrees,
   projectIdFor,
   remoteOwner,
   removeProjectSettings,
@@ -14,7 +20,11 @@ import {
   writeProjectSettings,
 } from "./core";
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vibeland-cli-test-"));
+// realpath: macOS symlinks /var -> /private/var, and git reports real paths.
+// Comparing a non-canonical fixture path against a canonical one is a test bug.
+const tmp = fs.realpathSync(
+  fs.mkdtempSync(path.join(os.tmpdir(), "vibeland-cli-test-"))
+);
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 function repo(name: string): string {
@@ -156,4 +166,96 @@ test("an existing .gitignore without a trailing newline is not corrupted", () =>
     .filter(Boolean);
   assert.ok(lines.includes("dist"), "clobbered the existing rule");
   assert.ok(lines.includes(".claude/settings.local.json"));
+});
+
+/* ------- git worktrees ------- */
+
+function worktree(main: string, name: string): string {
+  const dir = path.join(path.dirname(main), name);
+  execFileSync("git", ["worktree", "add", "-q", "-b", name, dir], {
+    cwd: main,
+    stdio: "ignore",
+  });
+  return dir;
+}
+
+function commit(dir: string) {
+  fs.writeFileSync(path.join(dir, "a.txt"), "hi");
+  execFileSync("git", ["add", "-A"], { cwd: dir, stdio: "ignore" });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "-qm", "init"], { cwd: dir, stdio: "ignore" });
+}
+
+test("a worktree resolves to its main project, not a new one", () => {
+  const main = repo("wt-main");
+  commit(main);
+  const tree = worktree(main, "wt-feature");
+
+  // Agent tools (Conductor, super.engineer) run entirely inside worktrees.
+  // Standing in one must identify the project it belongs to.
+  assert.equal(projectRoot(tree), main);
+  assert.equal(projectRoot(main), main);
+  assert.notEqual(gitRoot(tree), main, "sanity: the checkout root does differ");
+});
+
+test("the same project id is produced from any checkout", () => {
+  const main = repo("wt-id");
+  commit(main);
+  const tree = worktree(main, "wt-id-feature");
+  const salt = "fixed-salt";
+  assert.equal(
+    projectIdFor(salt, projectRoot(tree)!),
+    projectIdFor(salt, projectRoot(main)!),
+    "a worktree must not report as a separate project"
+  );
+});
+
+test("worktrees are enumerated from any checkout", () => {
+  const main = repo("wt-list");
+  commit(main);
+  const tree = worktree(main, "wt-list-feature");
+  for (const from of [main, tree]) {
+    const trees = listWorktrees(from);
+    assert.equal(trees.length, 2, `from ${from}`);
+    assert.ok(trees.includes(main));
+    assert.ok(trees.includes(tree));
+  }
+});
+
+test("a worktree created after linking is reported as uncovered", () => {
+  const main = repo("wt-cover");
+  commit(main);
+  writeProjectSettings(main, "https://vibeland.dev", "tok");
+  assert.deepEqual(uncoveredWorktrees(main), [], "main is covered");
+
+  // `git worktree add` does not copy the gitignored settings file
+  const tree = worktree(main, "wt-cover-feature");
+  assert.equal(
+    fs.existsSync(settingsPathFor(tree)),
+    false,
+    "settings must not have been copied — that is the whole bug"
+  );
+  assert.deepEqual(uncoveredWorktrees(main), [tree]);
+
+  // healing it uses the token already on disk, not a new grant
+  writeProjectSettings(tree, "https://vibeland.dev", readProjectToken(main)!);
+  assert.deepEqual(uncoveredWorktrees(main), []);
+  assert.equal(readProjectToken(tree), "tok");
+});
+
+test("info/exclude covers every worktree without needing a commit", () => {
+  const main = repo("wt-exclude");
+  commit(main);
+  ensureExcluded(main);
+  const tree = worktree(main, "wt-exclude-feature");
+  writeProjectSettings(tree, "https://vibeland.dev", "tok");
+
+  const dirty = execFileSync("git", ["status", "--porcelain"], {
+    cwd: tree,
+    encoding: "utf8",
+  });
+  assert.ok(
+    !dirty.includes("settings.local.json"),
+    `git can see the token file inside the worktree:\n${dirty}`
+  );
 });

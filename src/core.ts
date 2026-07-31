@@ -160,6 +160,23 @@ export function copyToClipboard(text: string): boolean {
 
 /* ------- git ------- */
 
+/**
+ * Resolve symlinks so a path is one canonical string.
+ *
+ * git reports real paths (`/private/var/…`) while `path.resolve` leaves
+ * symlinks alone (`/var/…`). Without this the same repo hashes to two
+ * different slot keys — and two different project ids — depending on which
+ * way you reached it, which silently splits a project's metrics in half.
+ * macOS symlinks /tmp, and symlinked project directories are common.
+ */
+function realpath(p: string): string {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
 function git(args: string[], cwd: string): string | null {
   try {
     return execFileSync("git", args, {
@@ -172,8 +189,51 @@ function git(args: string[], cwd: string): string | null {
   }
 }
 
-export const gitRoot = (cwd = process.cwd()) =>
-  git(["rev-parse", "--show-toplevel"], cwd);
+/** Root of the checkout you are standing in — a worktree has its own. */
+export function gitRoot(cwd = process.cwd()): string | null {
+  const root = git(["rev-parse", "--show-toplevel"], cwd);
+  return root ? realpath(root) : null;
+}
+
+/** Absolute path of the shared git dir. Identical from every worktree. */
+export function commonGitDir(cwd = process.cwd()): string | null {
+  const abs = git(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    cwd
+  );
+  // --path-format landed in git 2.31; fall back to resolving by hand
+  const raw = abs ?? git(["rev-parse", "--git-common-dir"], cwd);
+  return raw ? realpath(path.resolve(cwd, raw)) : null;
+}
+
+/**
+ * The main worktree's root — the canonical identity of a project.
+ *
+ * Tools like Conductor and super.engineer run agents inside `git worktree`
+ * checkouts in unrelated directories. Keying identity off the shared git dir
+ * makes every checkout of a repo the same project, instead of each worktree
+ * looking like a brand-new unlinked one.
+ */
+export function projectRoot(cwd = process.cwd()): string | null {
+  const common = commonGitDir(cwd);
+  if (!common) return null;
+  return path.basename(common) === ".git" ? path.dirname(common) : common;
+}
+
+/** Every checkout of this repo, main worktree first. */
+export function listWorktrees(cwd = process.cwd()): string[] {
+  const out = git(["worktree", "list", "--porcelain"], cwd);
+  if (!out) {
+    const root = gitRoot(cwd);
+    return root ? [root] : [];
+  }
+  return out
+    .split("\n")
+    .filter((l) => l.startsWith("worktree "))
+    .map((l) => l.slice("worktree ".length).trim())
+    .filter(Boolean)
+    .map(realpath);
+}
 
 export const gitRemote = (root: string) =>
   git(["remote", "get-url", "origin"], root);
@@ -188,12 +248,27 @@ export function remoteOwner(remote: string | null): string | null {
 }
 
 export type Discovered = {
+  /** canonical main-worktree root; slots are keyed by this */
   root: string;
   label: string;
   owner: string | null;
   remote: string | null;
   linked: ProjectSlot | null;
+  /** every checkout of this repo, including worktrees elsewhere on disk */
+  worktrees: string[];
 };
+
+function describe(root: string): Discovered {
+  const remote = gitRemote(root);
+  return {
+    root,
+    label: path.basename(root),
+    remote,
+    owner: remoteOwner(remote),
+    linked: readSlot(root),
+    worktrees: listWorktrees(root),
+  };
+}
 
 /**
  * Find git repositories near `dir`, one level deep. Deliberately shallow —
@@ -202,7 +277,8 @@ export type Discovered = {
  */
 export function discoverRepos(dir: string): Discovered[] {
   const found: string[] = [];
-  const here = gitRoot(dir);
+  // canonical root, so standing inside a worktree finds the real project
+  const here = projectRoot(dir);
   if (here) found.push(here);
 
   let entries: fs.Dirent[] = [];
@@ -215,19 +291,13 @@ export function discoverRepos(dir: string): Discovered[] {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     if (entry.name === "node_modules") continue;
     const child = path.join(dir, entry.name);
-    if (fs.existsSync(path.join(child, ".git"))) found.push(child);
+    if (!fs.existsSync(path.join(child, ".git"))) continue;
+    // a scanned directory may itself be a worktree; fold it into its project
+    const canonical = projectRoot(child);
+    if (canonical) found.push(canonical);
   }
 
-  return [...new Set(found)].map((root) => {
-    const remote = gitRemote(root);
-    return {
-      root,
-      label: path.basename(root),
-      remote,
-      owner: remoteOwner(remote),
-      linked: readSlot(root),
-    };
-  });
+  return [...new Set(found)].map(describe);
 }
 
 /* ------- claude code project settings ------- */
@@ -276,6 +346,23 @@ export function writeProjectSettings(
   return file;
 }
 
+/** The ingest token already written into a checkout, if any. */
+export function readProjectToken(root: string): string | null {
+  const data = readJson<Record<string, unknown>>(settingsPathFor(root), {});
+  const env = data.env as Record<string, string> | undefined;
+  const header = env?.OTEL_EXPORTER_OTLP_HEADERS;
+  const match = header?.match(/Bearer\s+(\S+)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Checkouts of a linked project that are missing the telemetry config —
+ * typically worktrees created after the project was linked.
+ */
+export function uncoveredWorktrees(root: string): string[] {
+  return listWorktrees(root).filter((tree) => !readProjectToken(tree));
+}
+
 export function removeProjectSettings(root: string) {
   const file = settingsPathFor(root);
   if (!fs.existsSync(file)) return;
@@ -288,10 +375,43 @@ export function removeProjectSettings(root: string) {
   writeJson(file, data);
 }
 
+const IGNORE_PATTERN = ".claude/settings.local.json";
+
+/**
+ * Also write the rule into the shared `info/exclude`.
+ *
+ * `.gitignore` is a tracked file, so it only protects a worktree once it has
+ * been committed — and a fresh `git worktree add` happens long before that.
+ * `info/exclude` lives in the shared git dir, applies to every worktree
+ * immediately, and never needs a commit. Belt and braces on the one failure
+ * that really hurts: committing an ingest token.
+ */
+export function ensureExcluded(cwd: string): void {
+  const common = commonGitDir(cwd);
+  if (!common) return;
+  const file = path.join(common, "info", "exclude");
+  try {
+    let current = "";
+    try {
+      current = fs.readFileSync(file, "utf8");
+    } catch {
+      /* no info/exclude yet */
+    }
+    if (current.split("\n").some((l) => l.trim() === IGNORE_PATTERN)) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(
+      file,
+      `${current && !current.endsWith("\n") ? "\n" : ""}# vibeland: contains an ingest token, do not commit\n${IGNORE_PATTERN}\n`
+    );
+  } catch {
+    /* read-only or unusual git dir — .gitignore still covers the common case */
+  }
+}
+
 /** Returns true when the ignore rule had to be added. */
 export function ensureGitignored(root: string): boolean {
   const file = path.join(root, ".gitignore");
-  const pattern = ".claude/settings.local.json";
+  const pattern = IGNORE_PATTERN;
   let current = "";
   try {
     current = fs.readFileSync(file, "utf8");

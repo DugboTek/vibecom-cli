@@ -11,10 +11,14 @@ import {
   copyToClipboard,
   deleteSlot,
   discoverRepos,
+  ensureExcluded,
   ensureGitignored,
+  listWorktrees,
+  projectRoot,
+  readProjectToken,
+  uncoveredWorktrees,
   fetchAllTiers,
   fetchConsent,
-  gitRoot,
   isTrusted,
   listSlots,
   mintProjectToken,
@@ -292,8 +296,15 @@ async function applyLinks(
       spin.stop(bad(`${repo.label}: ${e instanceof Error ? e.message : e}`));
       continue;
     }
-    writeProjectSettings(repo.root, origin, token);
+    /* Every checkout gets the config, not just the one we are standing in.
+       A worktree starts with no .claude/settings.local.json — the file is
+       gitignored, so `git worktree add` never copies it — and agent tools do
+       all their work in worktrees. Covering only the main checkout would mean
+       tracking almost nothing, silently. */
+    const trees = listWorktrees(repo.root);
+    for (const tree of trees) writeProjectSettings(tree, origin, token);
     const added = ensureGitignored(repo.root);
+    ensureExcluded(repo.root);
     writeSlot({
       root: repo.root,
       salt,
@@ -303,8 +314,11 @@ async function applyLinks(
       origin,
       linkedAt: new Date().toISOString(),
     });
+    const extra = trees.length - 1;
     spin.stop(
-      `${pc.bold(repo.label)} ${pc.dim("→")} ${projectId.slice(0, 12)}…${added ? pc.dim("  (+.gitignore)") : ""}`
+      `${pc.bold(repo.label)} ${pc.dim("→")} ${projectId.slice(0, 12)}…` +
+        (extra > 0 ? pc.dim(`  +${extra} worktree${extra === 1 ? "" : "s"}`) : "") +
+        (added ? pc.dim("  (+.gitignore)") : "")
     );
     count++;
   }
@@ -327,7 +341,7 @@ async function runLink(cred: Credentials, searchDir: string): Promise<number> {
     await pulse("loading permission tiers", fetchAllTiers(origin))
   ).tiers;
 
-  const here = gitRoot();
+  const here = projectRoot();
   let selected: Discovered[] = [];
   let tier: Tier = 1;
   let consent: ConsentInfo | null = null;
@@ -382,6 +396,37 @@ async function runLink(cred: Credentials, searchDir: string): Promise<number> {
   return count;
 }
 
+/**
+ * Cover worktrees added since a project was linked.
+ *
+ * No git hook fires on `git worktree add`, and agent tools create them
+ * constantly, so the only reliable moment to heal is the next time the CLI
+ * runs. Reuses the existing token — this is not a new grant, it is the same
+ * consent reaching a checkout that git skipped.
+ */
+function syncWorktrees(): { project: string; covered: string[] }[] {
+  const healed: { project: string; covered: string[] }[] = [];
+  for (const slot of listSlots()) {
+    const token = readProjectToken(slot.root);
+    if (!token) continue; // main checkout gone or unlinked by hand
+    const missing = uncoveredWorktrees(slot.root);
+    if (missing.length === 0) continue;
+    for (const tree of missing) writeProjectSettings(tree, slot.origin, token);
+    ensureExcluded(slot.root);
+    healed.push({ project: slot.label, covered: missing });
+  }
+  return healed;
+}
+
+function reportSync(healed: ReturnType<typeof syncWorktrees>) {
+  for (const { project, covered } of healed) {
+    p.log.success(
+      `${pc.bold(project)}: covered ${covered.length} new worktree${covered.length === 1 ? "" : "s"}`
+    );
+    for (const tree of covered) console.log(bullet(pc.dim(tree)));
+  }
+}
+
 /* =============================================================== wizard === */
 
 function slotChoices(slots: ProjectSlot[]) {
@@ -417,7 +462,7 @@ async function menu(cred: Credentials): Promise<boolean> {
 
   switch (action) {
     case "link": {
-      const here = gitRoot();
+      const here = projectRoot();
       await runLink(cred, here ? path.dirname(here) : process.cwd());
       return true;
     }
@@ -452,6 +497,7 @@ async function menu(cred: Credentials): Promise<boolean> {
               owner: null,
               remote: null,
               linked: slot,
+              worktrees: listWorktrees(slot.root),
             },
           ],
           tier
@@ -507,9 +553,11 @@ async function wizard() {
     );
   }
 
+  reportSync(syncWorktrees());
+
   // First run with nothing linked goes straight into connecting.
   if (listSlots().length === 0) {
-    const here = gitRoot();
+    const here = projectRoot();
     await runLink(cred, here ? path.dirname(here) : process.cwd());
   }
 
@@ -571,9 +619,13 @@ async function doUnlink(cred: Credentials, slot: ProjectSlot) {
       return { ok: false };
     })
   );
-  removeProjectSettings(slot.root);
+  // strip every checkout, or a stale worktree keeps a now-revoked token on disk
+  const trees = listWorktrees(slot.root);
+  for (const tree of trees) removeProjectSettings(tree);
   deleteSlot(slot.root);
-  p.log.success(`unlinked ${slot.label}`);
+  p.log.success(
+    `unlinked ${slot.label}${trees.length > 1 ? pc.dim(` (${trees.length} checkouts)`) : ""}`
+  );
   p.note(
     [
       "Token revoked server-side and the local salt deleted, so this",
@@ -586,7 +638,7 @@ async function doUnlink(cred: Credentials, slot: ProjectSlot) {
 }
 
 function slotHere(): ProjectSlot {
-  const root = gitRoot();
+  const root = projectRoot();
   if (!root) die("not inside a git repository");
   const slot = readSlot(root);
   if (!slot) die("this project is not linked — run " + pc.bold("vibeland"));
@@ -611,12 +663,25 @@ async function status() {
     console.log(bullet(pc.dim("none — nothing is being collected")));
   } else {
     for (const s of slots) {
+      const trees = listWorktrees(s.root);
+      const missing = uncoveredWorktrees(s.root);
       console.log(
         bullet(
           `${tierSwatch(s.tier)} ${pc.bold(s.label.padEnd(18))} ${pc.dim("→")} ${pc.cyan(s.origin)}`
         )
       );
       console.log(bullet(pc.dim(`   ${s.root}`)));
+      if (trees.length > 1) {
+        const covered = trees.length - missing.length;
+        console.log(
+          bullet(
+            pc.dim(`   ${covered}/${trees.length} checkouts reporting`) +
+              (missing.length > 0
+                ? pc.yellow(`  — run vibeland to cover ${missing.length}`)
+                : "")
+          )
+        );
+      }
     }
   }
 
@@ -671,7 +736,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     const cred = requireLogin();
     await banner("connect your projects");
     p.intro(gradient("  link projects  "));
-    const here = gitRoot();
+    const here = projectRoot();
     await runLink(
       cred,
       args[0] ? path.resolve(args[0]) : here ? path.dirname(here) : process.cwd()
