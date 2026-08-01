@@ -129,6 +129,73 @@ export const newSalt = () => randomBytes(16).toString("hex");
 export const projectIdFor = (salt: string, root: string) =>
   sha256(`${salt}:${root}`).slice(0, 32);
 
+/* ------- transcript scan watermarks ------- */
+
+const MARKS_FILE = path.join(CONFIG_DIR, "scan-marks.json");
+
+/**
+ * file path -> what we have already consumed from it.
+ *
+ * `root` and `sessionId` are remembered because a transcript states its cwd and
+ * session id only in its opening records. Once those are consumed, an
+ * incremental re-read has no idea which project the file belongs to — without
+ * this it would look unattributable and every subsequent line from a live
+ * session would be silently dropped.
+ */
+export type ScanMarks = Record<
+  string,
+  { lines: number; mtimeMs: number; root?: string; sessionId?: string }
+>;
+
+export const readScanMarks = (): ScanMarks => readJson<ScanMarks>(MARKS_FILE, {});
+export const writeScanMarks = (m: ScanMarks) => writeJson(MARKS_FILE, m);
+
+/** Send derived session counters through the normal authenticated ingest path. */
+export async function sendScanned(
+  origin: string,
+  token: string,
+  sessions: {
+    tool: string;
+    sessionId: string;
+    model: string | null;
+    turns: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    costUsd: number;
+  }[]
+): Promise<{ accepted: number; dropped: number }> {
+  const attr = (key: string, value: string | number) => ({
+    key,
+    value:
+      typeof value === "number"
+        ? { doubleValue: value }
+        : { stringValue: value },
+  });
+
+  const logRecords = sessions.map((s) => ({
+    attributes: [
+      attr("event.name", "vibeland.session"),
+      attr("tool", s.tool),
+      attr("session.id", s.sessionId),
+      ...(s.model ? [attr("model", s.model)] : []),
+      attr("turns", s.turns),
+      attr("input_tokens", s.inputTokens),
+      attr("output_tokens", s.outputTokens),
+      attr("cache_read_tokens", s.cacheReadTokens),
+      attr("cache_creation_tokens", s.cacheCreationTokens),
+      attr("cost_usd", s.costUsd),
+    ],
+  }));
+
+  return request<{ accepted: number; dropped: number }>(
+    origin,
+    "/api/v1/logs",
+    json({ resourceLogs: [{ scopeLogs: [{ logRecords }] }] }, token)
+  );
+}
+
 /* ------- clipboard ------- */
 
 /** Platform copy commands, tried in order. First one present wins. */

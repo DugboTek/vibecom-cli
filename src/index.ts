@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
@@ -16,7 +17,10 @@ import {
   listWorktrees,
   projectRoot,
   readProjectToken,
+  readScanMarks,
+  sendScanned,
   uncoveredWorktrees,
+  writeScanMarks,
   fetchAllTiers,
   fetchConsent,
   isTrusted,
@@ -31,6 +35,7 @@ import {
   removeProjectSettings,
   resolveOrigin,
   revokeProjectToken,
+  sha256,
   settingsPathFor,
   startDeviceFlow,
   trustOwner,
@@ -39,6 +44,11 @@ import {
   writeProjectSettings,
   writeSlot,
 } from "./core";
+import {
+  kimiWorkdirs,
+  transcriptSources,
+  type SessionUsage,
+} from "./transcripts";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
    their own, so only bare console.log lines need one from us. */
 import {
@@ -427,6 +437,119 @@ function reportSync(healed: ReturnType<typeof syncWorktrees>) {
   }
 }
 
+/* ================================================================ scan === */
+
+/**
+ * Derive usage from transcripts the tools have already written to disk.
+ *
+ * This is the only way to cover a session that is already running: OTLP env
+ * vars are read once at process start, so an agent mid-flight can never be
+ * made to export. It also supplies the user-turn count, which the live metrics
+ * stream does not carry — and therefore the only basis for verified one-shot.
+ *
+ * A session is only sent if its working directory belongs to a project you
+ * have linked. Everything else on disk is ignored.
+ */
+async function runScan(): Promise<{
+  sent: number;
+  sessions: number;
+  skipped: number;
+  byTool: Record<string, number>;
+}> {
+  const slots = listSlots();
+  if (slots.length === 0) return { sent: 0, sessions: 0, skipped: 0, byTool: {} };
+
+  const marks = readScanMarks();
+  const kimiDirs = kimiWorkdirs();
+  const byProject = new Map<string, SessionUsage[]>();
+  let skipped = 0;
+  const byTool: Record<string, number> = {};
+
+  for (const source of transcriptSources()) {
+    for (const file of source.files) {
+      let stat: { mtimeMs: number };
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      const mark = marks[file];
+      // unchanged since last scan — nothing new to read
+      if (mark && mark.mtimeMs === stat.mtimeMs) continue;
+
+      const usage = source.parse(file, mark?.lines ?? 0);
+      if (!usage) continue;
+
+      const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
+      const root = cwd ? projectRoot(cwd) : null;
+      const slot = root
+        ? slots.find((s) => s.root === root)
+        : // kimi encodes the workdir as sha256(root)[:12] in its directory name
+          usage.workspaceHash
+          ? slots.find((s) => sha256(s.root).startsWith(usage.workspaceHash!))
+          : // an incremental read is past the header records that named the
+            // project, so fall back to what the previous scan resolved
+            mark?.root
+            ? slots.find((s) => s.root === mark.root)
+            : undefined;
+      // likewise for the session id, which only appears in the opening records
+      usage.sessionId = usage.sessionId || mark?.sessionId || usage.sessionId;
+
+      if (!slot) {
+        skipped++;
+        // still advance the mark; an unlinked project is not pending work
+        marks[file] = { lines: usage.lines, mtimeMs: usage.mtimeMs };
+        continue;
+      }
+      const remembered = { root: slot.root, sessionId: usage.sessionId };
+      const total =
+        usage.turns +
+        usage.inputTokens +
+        usage.outputTokens +
+        usage.cacheReadTokens +
+        usage.cacheCreationTokens;
+      if (total === 0) {
+        marks[file] = { lines: usage.lines, mtimeMs: usage.mtimeMs, ...remembered };
+        continue;
+      }
+      usage.root = remembered.root;
+      byProject.set(slot.root, [...(byProject.get(slot.root) ?? []), usage]);
+      byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
+    }
+  }
+
+  let sent = 0;
+  let sessions = 0;
+  for (const [root, list] of byProject) {
+    const slot = slots.find((s) => s.root === root)!;
+    const token = readProjectToken(slot.root);
+    if (!token) continue;
+    // chunked so one project with hundreds of transcripts stays under the
+    // request size limit
+    for (let i = 0; i < list.length; i += 50) {
+      const batch = list.slice(i, i + 50);
+      try {
+        const res = await sendScanned(slot.origin, token, batch);
+        sent += res.accepted;
+        sessions += batch.length;
+        for (const u of batch) {
+          marks[u.file] = {
+            lines: u.lines,
+            mtimeMs: u.mtimeMs,
+            root: u.root,
+            sessionId: u.sessionId,
+          };
+        }
+      } catch (e) {
+        p.log.warn(`${slot.label}: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+  }
+
+  writeScanMarks(marks);
+  return { sent, sessions, skipped, byTool };
+}
+
 /* =============================================================== wizard === */
 
 function slotChoices(slots: ProjectSlot[]) {
@@ -449,13 +572,19 @@ async function menu(cred: Credentials): Promise<boolean> {
           label: "Change what a project shares",
           hint: "switch tier",
         },
+        {
+          value: "scan",
+          label: "Import from running + past sessions",
+          hint: "no restart needed",
+        },
         { value: "preview", label: "See exactly what gets sent" },
         { value: "unlink", label: "Stop collecting from a project" },
         { value: "logout", label: pc.dim("Sign out") },
         { value: "done", label: pc.dim("Done") },
       ].filter(
         (o) =>
-          slots.length > 0 || !["tier", "preview", "unlink"].includes(o.value)
+          slots.length > 0 ||
+          !["tier", "preview", "unlink", "scan"].includes(o.value)
       ),
     })
   );
@@ -503,6 +632,15 @@ async function menu(cred: Credentials): Promise<boolean> {
           tier
         );
       }
+      return true;
+    }
+    case "scan": {
+      const r = await pulse("reading transcripts on disk", runScan());
+      p.log.success(
+        r.sessions === 0
+          ? "nothing new since the last scan"
+          : `${r.sessions} session(s) imported — ${r.sent} rows`
+      );
       return true;
     }
     case "preview": {
@@ -710,6 +848,7 @@ async function help() {
     ["preview", "show exactly what leaves this repo"],
     ["status", "linked projects and trusted owners"],
     ["sync", "cover worktrees created since linking"],
+    ["scan", "import usage from running + past sessions"],
     ["unlink", "stop collecting from this repo"],
     ["trust <owner>", "allow repos under an org you control"],
     ["logout", "remove stored credentials"],
@@ -750,6 +889,29 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.outro(pc.dim("no other shape exists"));
   },
   status: () => status(),
+  scan: async () => {
+    requireLogin();
+    p.intro(gradient("  scan  "));
+    const r = await pulse(
+      "reading transcripts from Claude Code, Codex and Kimi",
+      runScan()
+    );
+    if (r.sessions === 0) {
+      p.log.success("nothing new since the last scan");
+    } else {
+      p.log.success(
+        `${r.sessions} session(s) from ${Object.entries(r.byTool)
+          .map(([t, n]) => `${t} ×${n}`)
+          .join(", ")} — ${r.sent} rows accepted`
+      );
+    }
+    if (r.skipped > 0) {
+      console.log(
+        bullet(pc.dim(`${r.skipped} session(s) in unlinked projects — ignored`))
+      );
+    }
+    p.outro(pc.dim("covers sessions already running; no restart needed"));
+  },
   sync: async () => {
     p.intro(gradient("  sync  "));
     const healed = syncWorktrees();
