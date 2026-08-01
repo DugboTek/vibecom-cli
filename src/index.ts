@@ -4,6 +4,8 @@ import * as p from "@clack/prompts";
 import pc from "picocolors";
 import {
   ApiError,
+  BUILD,
+  selfUpdate,
   type ConsentInfo,
   type Credentials,
   type Discovered,
@@ -849,6 +851,7 @@ async function help() {
     ["status", "linked projects and trusted owners"],
     ["sync", "cover worktrees created since linking"],
     ["scan", "import usage from running + past sessions"],
+    ["update", "pull the newest CLI from your server"],
     ["unlink", "stop collecting from this repo"],
     ["trust <owner>", "allow repos under an org you control"],
     ["logout", "remove stored credentials"],
@@ -889,6 +892,15 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.outro(pc.dim("no other shape exists"));
   },
   status: () => status(),
+  update: async () => {
+    const origin = resolveOrigin();
+    p.intro(gradient("  update  "));
+    const r = await pulse(`fetching from ${origin}`, selfUpdate(origin));
+    p.log.success(
+      r.updated ? `updated to build ${r.build}` : "already on the latest build"
+    );
+    p.outro(pc.dim(`current build ${BUILD}`));
+  },
   scan: async () => {
     requireLogin();
     p.intro(gradient("  scan  "));
@@ -955,7 +967,7 @@ async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (cmd === undefined) return wizard();
   if (cmd === "--version" || cmd === "version") {
-    console.log(`vibeland ${process.env.VIBELAND_VERSION ?? "3.1.0"}`);
+    console.log(`vibeland 3.2.0 (build ${BUILD})`);
     return;
   }
   const handler = COMMANDS[cmd.replace(/^--/, "")];

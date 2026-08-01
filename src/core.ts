@@ -596,3 +596,47 @@ export const revokeProjectToken = (
     `/api/tokens/project?projectId=${encodeURIComponent(projectId)}`,
     { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }
   );
+
+/* ------- self update ------- */
+
+declare const __VIBELAND_BUILD__: string;
+
+/** Build stamp injected by scripts/build-cli.mjs. */
+export const BUILD: string =
+  typeof __VIBELAND_BUILD__ === "string" ? __VIBELAND_BUILD__ : "dev";
+
+/**
+ * Replace this binary with the copy the server is serving.
+ *
+ * A CLI installed by `curl | bash` has no package manager behind it, so
+ * without this the only signal that your install predates a feature is the
+ * command not existing. Writes to a temp file in the same directory and
+ * renames, so an interrupted download cannot leave a broken executable.
+ */
+export async function selfUpdate(
+  origin: string
+): Promise<{ updated: boolean; build: string }> {
+  const target = realpath(process.argv[1]);
+  let res: Response;
+  try {
+    res = await fetch(origin + "/cli.js");
+  } catch {
+    throw new ApiError(`could not reach ${origin}`);
+  }
+  if (!res.ok) throw new ApiError(`HTTP ${res.status} fetching ${origin}/cli.js`);
+  const body = await res.text();
+
+  if (!body.startsWith("#!/usr/bin/env node")) {
+    throw new ApiError("that does not look like the CLI");
+  }
+  const stamp = body.match(/__VIBELAND_BUILD__|"(\d{4}-\d{2}-\d{2}T[\d:]+Z)"/);
+  const remoteBuild = stamp?.[1] ?? "unknown";
+  if (body.includes(`"${BUILD}"`) && BUILD !== "dev") {
+    return { updated: false, build: BUILD };
+  }
+
+  const tmp = target + ".new";
+  fs.writeFileSync(tmp, body, { mode: 0o755 });
+  fs.renameSync(tmp, target);
+  return { updated: true, build: remoteBuild };
+}
