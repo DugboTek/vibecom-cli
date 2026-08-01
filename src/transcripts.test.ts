@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 
-import { kimiWorkspaceHash, transcriptSources } from "./transcripts";
+import {
+  groupBySession,
+  kimiWorkspaceHash,
+  transcriptSources,
+  type SessionUsage,
+} from "./transcripts";
 
 const tmp = fs.realpathSync(
   fs.mkdtempSync(path.join(os.tmpdir(), "vibeland-transcript-test-"))
@@ -172,4 +177,54 @@ test("a partially written line is skipped, not fatal", () => {
   const u = parserFor("claude-code")(file, 0)!;
   assert.equal(u.turns, 1);
   assert.equal(u.inputTokens, 0);
+});
+
+/* ------- session dedup ------- */
+
+const usage = (o: Partial<SessionUsage>): SessionUsage => ({
+  tool: "claude-code",
+  sessionId: "s",
+  cwd: "/c",
+  model: null,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  costUsd: 0,
+  turns: 0,
+  lines: 0,
+  mtimeMs: 0,
+  file: "f",
+  ...o,
+});
+
+test("a resumed session collapses to its most complete transcript", () => {
+  // Claude Code replays history into each new file, so these are supersets,
+  // not separate work. Summing them inflated one real session by 21x.
+  const replays = [
+    usage({ file: "a", lines: 7, turns: 1, inputTokens: 100 }),
+    usage({ file: "b", lines: 812, turns: 1, inputTokens: 9_000 }),
+    usage({ file: "c", lines: 6827, turns: 399, inputTokens: 745_000 }),
+  ];
+  const [only] = groupBySession(replays);
+  assert.equal(groupBySession(replays).length, 1);
+  assert.equal(only.inputTokens, 745_000, "must take the largest, not the sum");
+  assert.equal(only.turns, 399);
+});
+
+test("ties are broken by recency", () => {
+  const [only] = groupBySession([
+    usage({ file: "old", lines: 10, mtimeMs: 1, inputTokens: 5 }),
+    usage({ file: "new", lines: 10, mtimeMs: 2, inputTokens: 9 }),
+  ]);
+  assert.equal(only.file, "new");
+});
+
+test("different sessions and different tools stay separate", () => {
+  const out = groupBySession([
+    usage({ sessionId: "a", lines: 5 }),
+    usage({ sessionId: "b", lines: 5 }),
+    usage({ sessionId: "a", tool: "codex", lines: 5 }),
+  ]);
+  assert.equal(out.length, 3, "a codex session must not collapse into claude");
 });

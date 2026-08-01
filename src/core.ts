@@ -142,10 +142,23 @@ const MARKS_FILE = path.join(CONFIG_DIR, "scan-marks.json");
  * this it would look unattributable and every subsequent line from a live
  * session would be silently dropped.
  */
-export type ScanMarks = Record<
-  string,
-  { lines: number; mtimeMs: number; root?: string; sessionId?: string }
->;
+export type ScanMark = {
+  /** cumulative totals already sent for this session */
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  /** the most complete transcript seen for this session */
+  file: string;
+  lines: number;
+  mtimeMs: number;
+  root?: string;
+};
+
+/** `tool:sessionId` -> what has already been sent for it. */
+export type ScanMarks = Record<string, ScanMark>;
 
 export const readScanMarks = (): ScanMarks => readJson<ScanMarks>(MARKS_FILE, {});
 export const writeScanMarks = (m: ScanMarks) => writeJson(MARKS_FILE, m);

@@ -457,99 +457,170 @@ async function runScan(): Promise<{
   sessions: number;
   skipped: number;
   byTool: Record<string, number>;
+  failed: string[];
 }> {
   const slots = listSlots();
-  if (slots.length === 0) return { sent: 0, sessions: 0, skipped: 0, byTool: {} };
+  if (slots.length === 0)
+    return { sent: 0, sessions: 0, skipped: 0, byTool: {}, failed: [] };
 
   const marks = readScanMarks();
   const kimiDirs = kimiWorkdirs();
-  const byProject = new Map<string, SessionUsage[]>();
-  let skipped = 0;
-  const byTool: Record<string, number> = {};
+
+  /* Group by session, not by file.
+
+     Claude Code writes a fresh transcript on every resume and replays the
+     prior history into it, so one session can span 149 files each containing a
+     superset of the last. Summing them inflated real usage by ~21x. The
+     authoritative record for a session is its most complete transcript, and
+     what we owe the server is the delta against what we already sent. */
+  type Group = { tool: string; sessionId: string; best: SessionUsage | null };
+  const groups = new Map<string, Group>();
 
   for (const source of transcriptSources()) {
     for (const file of source.files) {
-      let stat: { mtimeMs: number };
+      let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
       } catch {
         continue;
       }
-      const mark = marks[file];
-      // unchanged since last scan — nothing new to read
-      if (mark && mark.mtimeMs === stat.mtimeMs) continue;
-
-      const usage = source.parse(file, mark?.lines ?? 0);
+      let usage: SessionUsage | null = null;
+      try {
+        usage = source.parse(file, 0);
+      } catch {
+        continue;
+      }
       if (!usage) continue;
+      usage.mtimeMs = stat.mtimeMs;
 
-      const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
-      const root = cwd ? projectRoot(cwd) : null;
-      const slot = root
-        ? slots.find((s) => s.root === root)
-        : // kimi encodes the workdir as sha256(root)[:12] in its directory name
-          usage.workspaceHash
-          ? slots.find((s) => sha256(s.root).startsWith(usage.workspaceHash!))
-          : // an incremental read is past the header records that named the
-            // project, so fall back to what the previous scan resolved
-            mark?.root
-            ? slots.find((s) => s.root === mark.root)
-            : undefined;
-      // likewise for the session id, which only appears in the opening records
-      usage.sessionId = usage.sessionId || mark?.sessionId || usage.sessionId;
-
-      if (!slot) {
-        skipped++;
-        // still advance the mark; an unlinked project is not pending work
-        marks[file] = { lines: usage.lines, mtimeMs: usage.mtimeMs };
-        continue;
+      const key = `${usage.tool}:${usage.sessionId}`;
+      const group = groups.get(key) ?? {
+        tool: usage.tool,
+        sessionId: usage.sessionId,
+        best: null,
+      };
+      // "most complete" == most lines; ties broken by recency
+      if (
+        !group.best ||
+        usage.lines > group.best.lines ||
+        (usage.lines === group.best.lines && usage.mtimeMs > group.best.mtimeMs)
+      ) {
+        group.best = usage;
       }
-      const remembered = { root: slot.root, sessionId: usage.sessionId };
-      const total =
-        usage.turns +
-        usage.inputTokens +
-        usage.outputTokens +
-        usage.cacheReadTokens +
-        usage.cacheCreationTokens;
-      if (total === 0) {
-        marks[file] = { lines: usage.lines, mtimeMs: usage.mtimeMs, ...remembered };
-        continue;
-      }
-      usage.root = remembered.root;
-      byProject.set(slot.root, [...(byProject.get(slot.root) ?? []), usage]);
-      byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
+      groups.set(key, group);
     }
+  }
+
+  const byProject = new Map<string, { usage: SessionUsage; key: string; delta: SessionUsage }[]>();
+  let skipped = 0;
+  const byTool: Record<string, number> = {};
+
+  for (const [key, group] of groups) {
+    const usage = group.best;
+    if (!usage) continue;
+    const mark = marks[key];
+    if (
+      mark &&
+      mark.file === usage.file &&
+      mark.lines === usage.lines &&
+      mark.mtimeMs === usage.mtimeMs
+    ) {
+      continue; // unchanged since last scan
+    }
+
+    const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
+    const root = cwd ? projectRoot(cwd) : null;
+    const slot = root
+      ? slots.find((s) => s.root === root)
+      : usage.workspaceHash
+        ? slots.find((s) => sha256(s.root).startsWith(usage.workspaceHash!))
+        : mark?.root
+          ? slots.find((s) => s.root === mark.root)
+          : undefined;
+
+    if (!slot) {
+      skipped++;
+      continue;
+    }
+
+    // send only what is new since the last scan of this session
+    const delta: SessionUsage = {
+      ...usage,
+      turns: Math.max(0, usage.turns - (mark?.turns ?? 0)),
+      inputTokens: Math.max(0, usage.inputTokens - (mark?.inputTokens ?? 0)),
+      outputTokens: Math.max(0, usage.outputTokens - (mark?.outputTokens ?? 0)),
+      cacheReadTokens: Math.max(
+        0,
+        usage.cacheReadTokens - (mark?.cacheReadTokens ?? 0)
+      ),
+      cacheCreationTokens: Math.max(
+        0,
+        usage.cacheCreationTokens - (mark?.cacheCreationTokens ?? 0)
+      ),
+      costUsd: Math.max(0, usage.costUsd - (mark?.costUsd ?? 0)),
+      root: slot.root,
+    };
+    const total =
+      delta.turns +
+      delta.inputTokens +
+      delta.outputTokens +
+      delta.cacheReadTokens +
+      delta.cacheCreationTokens;
+    if (total === 0) {
+      marks[key] = markFor(usage, slot.root);
+      continue;
+    }
+    byProject.set(slot.root, [
+      ...(byProject.get(slot.root) ?? []),
+      { usage, key, delta },
+    ]);
+    byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
   }
 
   let sent = 0;
   let sessions = 0;
+  const failed = new Set<string>();
+
   for (const [root, list] of byProject) {
     const slot = slots.find((s) => s.root === root)!;
     const token = readProjectToken(slot.root);
     if (!token) continue;
-    // chunked so one project with hundreds of transcripts stays under the
-    // request size limit
     for (let i = 0; i < list.length; i += 50) {
       const batch = list.slice(i, i + 50);
       try {
-        const res = await sendScanned(slot.origin, token, batch);
+        const res = await sendScanned(
+          slot.origin,
+          token,
+          batch.map((b) => b.delta)
+        );
         sent += res.accepted;
         sessions += batch.length;
-        for (const u of batch) {
-          marks[u.file] = {
-            lines: u.lines,
-            mtimeMs: u.mtimeMs,
-            root: u.root,
-            sessionId: u.sessionId,
-          };
-        }
+        for (const b of batch) marks[b.key] = markFor(b.usage, slot.root);
       } catch (e) {
-        p.log.warn(`${slot.label}: ${e instanceof Error ? e.message : e}`);
+        // one line per project, not per batch
+        failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
       }
     }
   }
 
   writeScanMarks(marks);
-  return { sent, sessions, skipped, byTool };
+  return { sent, sessions, skipped, byTool, failed: [...failed] };
+}
+
+/** Record the session totals now known to be on the server. */
+function markFor(u: SessionUsage, root: string) {
+  return {
+    turns: u.turns,
+    inputTokens: u.inputTokens,
+    outputTokens: u.outputTokens,
+    cacheReadTokens: u.cacheReadTokens,
+    cacheCreationTokens: u.cacheCreationTokens,
+    costUsd: u.costUsd,
+    file: u.file,
+    lines: u.lines,
+    mtimeMs: u.mtimeMs,
+    root,
+  };
 }
 
 /* =============================================================== wizard === */
@@ -917,6 +988,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
           .join(", ")} — ${r.sent} rows accepted`
       );
     }
+    for (const f of r.failed) p.log.warn(f);
     if (r.skipped > 0) {
       console.log(
         bullet(pc.dim(`${r.skipped} session(s) in unlinked projects — ignored`))

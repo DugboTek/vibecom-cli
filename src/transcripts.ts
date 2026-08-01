@@ -303,3 +303,28 @@ export function kimiWorkdirs(): Map<string, string> {
   }
   return map;
 }
+
+/**
+ * Reduce transcripts to one entry per session, keeping the most complete.
+ *
+ * Claude Code starts a fresh transcript on every resume and replays the prior
+ * history into it, so a single session can span a hundred-plus files each
+ * containing a superset of the last. Summing them multiplies real usage — on
+ * one real machine by 8x overall and 21x for the worst session. The
+ * authoritative record is the longest transcript, with recency breaking ties.
+ */
+export function groupBySession(usages: SessionUsage[]): SessionUsage[] {
+  const best = new Map<string, SessionUsage>();
+  for (const u of usages) {
+    const key = `${u.tool}:${u.sessionId}`;
+    const cur = best.get(key);
+    if (
+      !cur ||
+      u.lines > cur.lines ||
+      (u.lines === cur.lines && u.mtimeMs > cur.mtimeMs)
+    ) {
+      best.set(key, u);
+    }
+  }
+  return [...best.values()];
+}
