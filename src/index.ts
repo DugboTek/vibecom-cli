@@ -87,7 +87,7 @@ function orExit<T>(value: T | symbol): T {
 
 function requireLogin(): Credentials {
   const cred = readCredentials();
-  if (!cred?.token) die("not signed in — run " + pc.bold("vibeland"));
+  if (!cred?.token) die("not signed in — run " + pc.bold("vibecom"));
   return cred;
 }
 
@@ -200,7 +200,7 @@ async function stepPickTier(
 ): Promise<Tier> {
   return orExit(
     await p.select({
-      message: "How much should vibeland see?",
+      message: "How much should vibecom see?",
       options: options.map((t) => ({
         value: t.id as Tier,
         label: `${tierSwatch(t.id)}  ${pc.bold(t.name)}`,
@@ -745,11 +745,11 @@ async function menu(cred: Credentials): Promise<boolean> {
   }
 }
 
-/** `vibeland` with no arguments: sign in if needed, connect, then stay open. */
+/** `vibecom` with no arguments: sign in if needed, connect, then stay open. */
 async function wizard() {
-  await banner("telemetry for AI-built software");
+  await banner("the community for AI builders");
   const existing = readCredentials();
-  p.intro(gradient(existing ? "  vibeland  " : "  welcome  "));
+  p.intro(gradient(existing ? "  vibecom  " : "  welcome  "));
 
   const cred = await ensureLogin();
   if (!existing) {
@@ -774,7 +774,7 @@ async function wizard() {
 
   while (await menu(cred));
   p.outro(
-    `${pc.dim("run")} ${pc.bold("vibeland")} ${pc.dim("anytime to change this")}`
+    `${pc.dim("run")} ${pc.bold("vibecom")} ${pc.dim("anytime to change this")}`
   );
 }
 
@@ -852,7 +852,7 @@ function slotHere(): ProjectSlot {
   const root = projectRoot();
   if (!root) die("not inside a git repository");
   const slot = readSlot(root);
-  if (!slot) die("this project is not linked — run " + pc.bold("vibeland"));
+  if (!slot) die("this project is not linked — run " + pc.bold("vibecom"));
   return slot;
 }
 
@@ -888,7 +888,7 @@ async function status() {
           bullet(
             pc.dim(`   ${covered}/${trees.length} checkouts reporting`) +
               (missing.length > 0
-                ? pc.yellow(`  — run vibeland to cover ${missing.length}`)
+                ? pc.yellow(`  — run vibecom to cover ${missing.length}`)
                 : "")
           )
         );
@@ -902,15 +902,15 @@ async function status() {
     console.log(rule("trusted owners"));
     for (const o of trusted) console.log(bullet(pc.dim(o)));
   }
-  p.outro(`${pc.dim("run")} ${pc.bold("vibeland")} ${pc.dim("to change this")}`);
+  p.outro(`${pc.dim("run")} ${pc.bold("vibecom")} ${pc.dim("to change this")}`);
 }
 
 async function help() {
-  await banner("telemetry for AI-built software");
+  await banner("the community for AI builders");
   console.log(rule("just run this"));
   console.log(
     bullet(
-      `${gradient("vibeland".padEnd(15))} ${pc.dim("sign in, connect projects, change anything")}`
+      `${gradient("vibecom".padEnd(15))} ${pc.dim("sign in, connect projects, change anything")}`
     )
   );
   console.log();
@@ -941,10 +941,10 @@ async function help() {
 
 const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   login: async () => {
-    await banner("telemetry for AI-built software");
+    await banner("the community for AI builders");
     p.intro(gradient("  sign in  "));
     const cred = await runLogin(resolveOrigin());
-    p.outro(`signed in as ${pc.bold(cred.username)} — run ${pc.bold("vibeland")} to connect projects`);
+    p.outro(`signed in as ${pc.bold(cred.username)} — run ${pc.bold("vibecom")} to connect projects`);
   },
   link: async (args) => {
     const cred = requireLogin();
@@ -955,7 +955,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       cred,
       args[0] ? path.resolve(args[0]) : here ? path.dirname(here) : process.cwd()
     );
-    p.outro(`${pc.bold("vibeland")} ${pc.dim("to change anything")}`);
+    p.outro(`${pc.bold("vibecom")} ${pc.dim("to change anything")}`);
   },
   preview: async () => {
     p.intro(gradient("  preview  "));
@@ -1017,12 +1017,12 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.outro(pc.dim("nothing from this project will be collected"));
   },
   trust: async (args) => {
-    if (args.length === 0) die("usage: vibeland trust <owner>");
+    if (args.length === 0) die("usage: vibecom trust <owner>");
     for (const owner of args) trustOwner(owner);
     p.log.success(`trusted ${args.join(", ")}`);
   },
   untrust: async (args) => {
-    if (args.length === 0) die("usage: vibeland untrust <owner>");
+    if (args.length === 0) die("usage: vibecom untrust <owner>");
     for (const owner of args) untrustOwner(owner);
     p.log.success(`untrusted ${args.join(", ")}`);
     p.log.warn("already-linked projects keep collecting — unlink them too");
@@ -1039,7 +1039,7 @@ async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (cmd === undefined) return wizard();
   if (cmd === "--version" || cmd === "version") {
-    console.log(`vibeland 3.2.0 (build ${BUILD})`);
+    console.log(`vibecom 3.2.0 (build ${BUILD})`);
     return;
   }
   const handler = COMMANDS[cmd.replace(/^--/, "")];

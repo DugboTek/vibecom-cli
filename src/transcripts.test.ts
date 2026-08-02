@@ -12,7 +12,7 @@ import {
 } from "./transcripts";
 
 const tmp = fs.realpathSync(
-  fs.mkdtempSync(path.join(os.tmpdir(), "vibeland-transcript-test-"))
+  fs.mkdtempSync(path.join(os.tmpdir(), "vibecom-transcript-test-"))
 );
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 

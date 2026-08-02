@@ -23,7 +23,7 @@ import {
 // realpath: macOS symlinks /var -> /private/var, and git reports real paths.
 // Comparing a non-canonical fixture path against a canonical one is a test bug.
 const tmp = fs.realpathSync(
-  fs.mkdtempSync(path.join(os.tmpdir(), "vibeland-cli-test-"))
+  fs.mkdtempSync(path.join(os.tmpdir(), "vibecom-cli-test-"))
 );
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -69,7 +69,7 @@ test("remoteOwner parses ssh, https, and .git forms", () => {
 
 test("settings are written to settings.local.json, never settings.json", () => {
   const dir = repo("scoped");
-  const file = writeProjectSettings(dir, "https://vibeland.dev", "tok_abc");
+  const file = writeProjectSettings(dir, "https://vibecom.build", "tok_abc");
 
   assert.equal(path.basename(file), "settings.local.json");
   assert.ok(!fs.existsSync(path.join(dir, ".claude", "settings.json")));
@@ -79,14 +79,14 @@ test("settings are written to settings.local.json, never settings.json", () => {
     data.env.OTEL_EXPORTER_OTLP_HEADERS,
     "Authorization=Bearer tok_abc"
   );
-  assert.equal(data.env.OTEL_EXPORTER_OTLP_ENDPOINT, "https://vibeland.dev/api");
+  assert.equal(data.env.OTEL_EXPORTER_OTLP_ENDPOINT, "https://vibecom.build/api");
   // prompt bodies must never be exported, at any tier
   assert.equal(data.env.OTEL_LOG_USER_PROMPTS, "0");
 });
 
 test("the token file is not world-readable", () => {
   const dir = repo("perms");
-  const file = writeProjectSettings(dir, "https://vibeland.dev", "tok_secret");
+  const file = writeProjectSettings(dir, "https://vibecom.build", "tok_secret");
   const mode = fs.statSync(file).mode & 0o777;
   assert.equal(mode, 0o600, `expected 0600, got ${mode.toString(8)}`);
 });
@@ -100,7 +100,7 @@ test("existing unrelated settings survive linking and unlinking", () => {
     JSON.stringify({ permissions: { allow: ["Bash"] }, env: { MY_VAR: "1" } })
   );
 
-  writeProjectSettings(dir, "https://vibeland.dev", "tok");
+  writeProjectSettings(dir, "https://vibecom.build", "tok");
   let data = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.deepEqual(data.permissions, { allow: ["Bash"] });
   assert.equal(data.env.MY_VAR, "1");
@@ -114,7 +114,7 @@ test("existing unrelated settings survive linking and unlinking", () => {
 
 test("unlinking drops the env block entirely when we added all of it", () => {
   const dir = repo("clean");
-  writeProjectSettings(dir, "https://vibeland.dev", "tok");
+  writeProjectSettings(dir, "https://vibecom.build", "tok");
   removeProjectSettings(dir);
   const data = JSON.parse(fs.readFileSync(settingsPathFor(dir), "utf8"));
   assert.equal(data.env, undefined);
@@ -125,7 +125,7 @@ test("corrupt settings.local.json does not throw or lose the link", () => {
   const file = settingsPathFor(dir);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, "{ this is not json");
-  writeProjectSettings(dir, "https://vibeland.dev", "tok");
+  writeProjectSettings(dir, "https://vibecom.build", "tok");
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "1");
 });
@@ -134,7 +134,7 @@ test("corrupt settings.local.json does not throw or lose the link", () => {
 
 test("the token file is gitignored, and git agrees", () => {
   const dir = repo("ignored");
-  writeProjectSettings(dir, "https://vibeland.dev", "tok");
+  writeProjectSettings(dir, "https://vibecom.build", "tok");
   assert.equal(ensureGitignored(dir), true, "should have added the rule");
 
   const tracked = execFileSync("git", ["status", "--porcelain"], {
@@ -225,7 +225,7 @@ test("worktrees are enumerated from any checkout", () => {
 test("a worktree created after linking is reported as uncovered", () => {
   const main = repo("wt-cover");
   commit(main);
-  writeProjectSettings(main, "https://vibeland.dev", "tok");
+  writeProjectSettings(main, "https://vibecom.build", "tok");
   assert.deepEqual(uncoveredWorktrees(main), [], "main is covered");
 
   // `git worktree add` does not copy the gitignored settings file
@@ -238,7 +238,7 @@ test("a worktree created after linking is reported as uncovered", () => {
   assert.deepEqual(uncoveredWorktrees(main), [tree]);
 
   // healing it uses the token already on disk, not a new grant
-  writeProjectSettings(tree, "https://vibeland.dev", readProjectToken(main)!);
+  writeProjectSettings(tree, "https://vibecom.build", readProjectToken(main)!);
   assert.deepEqual(uncoveredWorktrees(main), []);
   assert.equal(readProjectToken(tree), "tok");
 });
@@ -248,7 +248,7 @@ test("info/exclude covers every worktree without needing a commit", () => {
   commit(main);
   ensureExcluded(main);
   const tree = worktree(main, "wt-exclude-feature");
-  writeProjectSettings(tree, "https://vibeland.dev", "tok");
+  writeProjectSettings(tree, "https://vibecom.build", "tok");
 
   const dirty = execFileSync("git", ["status", "--porcelain"], {
     cwd: tree,

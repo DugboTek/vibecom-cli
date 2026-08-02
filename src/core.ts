@@ -6,10 +6,33 @@ import path from "node:path";
 
 /* ------- paths ------- */
 
-export const CONFIG_DIR = path.join(
-  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
-  "vibeland"
+const CONFIG_HOME =
+  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+export const CONFIG_DIR = path.join(CONFIG_HOME, "vibecom");
+const LEGACY_CONFIG_DIR = path.join(CONFIG_HOME, "vibeland");
+const LEGACY_MIGRATION_MARKER = path.join(
+  CONFIG_DIR,
+  ".migrated-from-vibeland"
 );
+
+/* Keep every existing link and credential across the rename. The old folder is
+   left in place as a recoverable backup; all future writes use vibecom. */
+let legacyChecked = false;
+function migrateLegacyConfig() {
+  if (legacyChecked) return;
+  legacyChecked = true;
+  if (fs.existsSync(LEGACY_MIGRATION_MARKER)) return;
+  if (!fs.existsSync(LEGACY_CONFIG_DIR)) return;
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  for (const entry of fs.readdirSync(LEGACY_CONFIG_DIR)) {
+    const target = path.join(CONFIG_DIR, entry);
+    if (fs.existsSync(target)) continue;
+    fs.cpSync(path.join(LEGACY_CONFIG_DIR, entry), target, { recursive: true });
+  }
+  fs.writeFileSync(LEGACY_MIGRATION_MARKER, new Date().toISOString() + "\n", {
+    mode: 0o600,
+  });
+}
 const CRED_FILE = path.join(CONFIG_DIR, "credentials.json");
 const PROJECTS_DIR = path.join(CONFIG_DIR, "projects");
 const TRUST_FILE = path.join(CONFIG_DIR, "trusted_owners.json");
@@ -36,8 +59,10 @@ function writeJson(file: string, value: unknown) {
 
 export type Credentials = { token: string; username: string; origin: string };
 
-export const readCredentials = (): Credentials | null =>
-  readJson<Credentials | null>(CRED_FILE, null);
+export const readCredentials = (): Credentials | null => {
+  migrateLegacyConfig();
+  return readJson<Credentials | null>(CRED_FILE, null);
+};
 
 export const writeCredentials = (c: Credentials) => writeJson(CRED_FILE, c);
 export const clearCredentials = () => fs.rmSync(CRED_FILE, { force: true });
@@ -48,19 +73,23 @@ export const clearCredentials = () => fs.rmSync(CRED_FILE, { force: true });
  * downloaded from. Explicit env var always wins.
  */
 export function resolveOrigin(): string {
+  if (process.env.VIBECOM_ORIGIN) return process.env.VIBECOM_ORIGIN;
   if (process.env.VIBELAND_ORIGIN) return process.env.VIBELAND_ORIGIN;
   const cred = readCredentials();
   if (cred?.origin) return cred.origin;
   try {
     return fs.readFileSync(ORIGIN_FILE, "utf8").trim();
   } catch {
-    return "https://vibeland.dev";
+    return "https://vibecom.build";
   }
 }
 
 /* ------- trusted repo owners ------- */
 
-export const readTrusted = (): string[] => readJson<string[]>(TRUST_FILE, []);
+export const readTrusted = (): string[] => {
+  migrateLegacyConfig();
+  return readJson<string[]>(TRUST_FILE, []);
+};
 
 export function isTrusted(owner: string): boolean {
   const needle = owner.toLowerCase();
@@ -95,8 +124,10 @@ export type ProjectSlot = {
 const slotPath = (root: string) =>
   path.join(PROJECTS_DIR, sha256(root) + ".json");
 
-export const readSlot = (root: string): ProjectSlot | null =>
-  readJson<ProjectSlot | null>(slotPath(root), null);
+export const readSlot = (root: string): ProjectSlot | null => {
+  migrateLegacyConfig();
+  return readJson<ProjectSlot | null>(slotPath(root), null);
+};
 
 export const writeSlot = (slot: ProjectSlot) =>
   writeJson(slotPath(slot.root), slot);
@@ -105,6 +136,7 @@ export const deleteSlot = (root: string) =>
   fs.rmSync(slotPath(root), { force: true });
 
 export function listSlots(): ProjectSlot[] {
+  migrateLegacyConfig();
   try {
     return fs
       .readdirSync(PROJECTS_DIR)
@@ -189,7 +221,7 @@ export async function sendScanned(
 
   const logRecords = sessions.map((s) => ({
     attributes: [
-      attr("event.name", "vibeland.session"),
+      attr("event.name", "vibecom.session"),
       attr("tool", s.tool),
       attr("session.id", s.sessionId),
       ...(s.model ? [attr("model", s.model)] : []),
@@ -481,7 +513,7 @@ export function ensureExcluded(cwd: string): void {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(
       file,
-      `${current && !current.endsWith("\n") ? "\n" : ""}# vibeland: contains an ingest token, do not commit\n${IGNORE_PATTERN}\n`
+      `${current && !current.endsWith("\n") ? "\n" : ""}# vibecom: contains an ingest token, do not commit\n${IGNORE_PATTERN}\n`
     );
   } catch {
     /* read-only or unusual git dir — .gitignore still covers the common case */
@@ -501,7 +533,7 @@ export function ensureGitignored(root: string): boolean {
   if (current.split("\n").some((line) => line.trim() === pattern)) return false;
   fs.appendFileSync(
     file,
-    `${current && !current.endsWith("\n") ? "\n" : ""}\n# vibeland: contains an ingest token, do not commit\n${pattern}\n`
+    `${current && !current.endsWith("\n") ? "\n" : ""}\n# vibecom: contains an ingest token, do not commit\n${pattern}\n`
   );
   return true;
 }
@@ -612,11 +644,11 @@ export const revokeProjectToken = (
 
 /* ------- self update ------- */
 
-declare const __VIBELAND_BUILD__: string;
+declare const __VIBECOM_BUILD__: string;
 
 /** Build stamp injected by scripts/build-cli.mjs. */
 export const BUILD: string =
-  typeof __VIBELAND_BUILD__ === "string" ? __VIBELAND_BUILD__ : "dev";
+  typeof __VIBECOM_BUILD__ === "string" ? __VIBECOM_BUILD__ : "dev";
 
 /**
  * Replace this binary with the copy the server is serving.
@@ -642,7 +674,7 @@ export async function selfUpdate(
   if (!body.startsWith("#!/usr/bin/env node")) {
     throw new ApiError("that does not look like the CLI");
   }
-  const stamp = body.match(/__VIBELAND_BUILD__|"(\d{4}-\d{2}-\d{2}T[\d:]+Z)"/);
+  const stamp = body.match(/__VIBECOM_BUILD__|"(\d{4}-\d{2}-\d{2}T[\d:]+Z)"/);
   const remoteBuild = stamp?.[1] ?? "unknown";
   if (body.includes(`"${BUILD}"`) && BUILD !== "dev") {
     return { updated: false, build: BUILD };
