@@ -164,7 +164,15 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
     if (rec.type === "session_meta") {
       if (typeof payload.session_id === "string") u.sessionId ||= payload.session_id;
       if (typeof payload.cwd === "string") u.cwd ||= payload.cwd;
+      // Older rollouts carried the model here; current ones do not.
       if (typeof payload.model === "string") u.model ||= payload.model;
+    }
+    /* Current Codex writes the model on turn_context, not session_meta —
+       session_meta only has model_provider. Without this every Codex session
+       reports no model, so its tokens land in the totals but never appear in
+       any per-model breakdown. */
+    if (rec.type === "turn_context" && typeof payload.model === "string") {
+      u.model ||= payload.model;
     }
     if (payload.type === "user_message") u.turns++;
     if (payload.type === "token_count") {

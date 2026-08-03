@@ -115,6 +115,33 @@ test("codex: user_message counts as a turn, totals are not summed twice", () => 
   assert.equal(u.cwd, "/code/app");
 });
 
+test("codex: the model comes from turn_context, not session_meta", () => {
+  // Current rollouts put model_provider on session_meta and the actual model
+  // on turn_context. Reading only session_meta left every Codex session
+  // unattributed, so its tokens counted but no model ever appeared.
+  const file = jsonl("cx-model.jsonl", [
+    {
+      type: "session_meta",
+      payload: { session_id: "cx2", cwd: "/code/app", model_provider: "openai" },
+    },
+    { type: "turn_context", payload: { cwd: "/code/app", model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "user_message" } },
+  ]);
+  assert.equal(parserFor("codex")(file, 0)!.model, "gpt-5.6-sol");
+});
+
+test("codex: an older rollout with the model on session_meta still works", () => {
+  const file = jsonl("cx-legacy.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx3", model: "gpt-5.1" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+  ]);
+  assert.equal(
+    parserFor("codex")(file, 0)!.model,
+    "gpt-5.1",
+    "session_meta wins when both are present — it names the session"
+  );
+});
+
 /* ------- kimi ------- */
 
 test("kimi: turn.prompt counts, usage.record accumulates", () => {
@@ -227,4 +254,23 @@ test("different sessions and different tools stay separate", () => {
     usage({ sessionId: "a", tool: "codex", lines: 5 }),
   ]);
   assert.equal(out.length, 3, "a codex session must not collapse into claude");
+});
+
+test("codex: a continuing session keeps its model past the watermark", () => {
+  // turn_context sits near the top of the rollout, so an incremental re-read
+  // starts past it. Without the remembered model, every scan after the first
+  // would report the session as unattributed.
+  const file = jsonl("cx-resume.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx4", cwd: "/code/app" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "user_message" } },
+    { type: "event_msg", payload: { type: "user_message" } },
+  ]);
+  const first = parserFor("codex")(file, 0)!;
+  assert.equal(first.model, "gpt-5.6-sol");
+
+  // Re-read from a watermark past the header: the parser alone cannot see it.
+  const resumed = parserFor("codex")(file, 2)!;
+  assert.equal(resumed.model, null, "the header is genuinely out of range");
+  assert.equal(resumed.turns, 2, "but the later turns are still counted");
 });
