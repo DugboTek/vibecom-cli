@@ -19,6 +19,7 @@ import {
   listWorktrees,
   projectRoot,
   readProjectToken,
+  recommendedRepos,
   readScanMarks,
   sendScanned,
   uncoveredWorktrees,
@@ -29,6 +30,7 @@ import {
   listSlots,
   mintProjectToken,
   newSalt,
+  openBrowser,
   pollDeviceToken,
   prepareProjectSettings,
   projectIdFor,
@@ -114,8 +116,9 @@ async function runLogin(origin: string): Promise<Credentials> {
 
   const copied = copyToClipboard(flow.userCode);
   const approveUrl = `${origin}/device?code=${flow.userCode}`;
+  const opened = openBrowser(approveUrl);
 
-  p.log.step("Approve this device:");
+  p.log.step(opened ? "Finish signing in in your browser" : "Approve this device");
   console.log();
   console.log(bigCode(flow.userCode));
   console.log(
@@ -124,7 +127,7 @@ async function runLogin(origin: string): Promise<Credentials> {
       : `  ${pc.dim("type the code above")}`
   );
   console.log();
-  console.log(bullet(`open ${pc.cyan(pc.underline(approveUrl))}`));
+  console.log(bullet(`${opened ? "opened" : "open"} ${pc.cyan(pc.underline(approveUrl))}`));
   console.log(bullet(pc.dim("the code is prefilled — just press Approve")));
   console.log();
 
@@ -425,6 +428,73 @@ async function runLink(cred: Credentials, searchDir: string): Promise<number> {
       `linked ${count}`
     );
   }
+  return count;
+}
+
+/** First-run path: one understandable choice, with conservative defaults. */
+async function quickStart(cred: Credentials, searchDir: string): Promise<number> {
+  const origin = cred.origin || resolveOrigin();
+  const repos = await pulse(
+    "finding your projects and coding tools",
+    Promise.resolve(discoverRepos(searchDir))
+  );
+  const selected = recommendedRepos(repos, cred.username, projectRoot());
+  if (selected.length === 0) {
+    p.log.info("I couldn't safely choose a personal project for you.");
+    return runLink(cred, searchDir);
+  }
+
+  const tools = transcriptSources()
+    .filter((source) => source.files.length > 0)
+    .map((source) =>
+      source.tool === "claude-code"
+        ? "Claude Code"
+        : source.tool === "codex"
+          ? "Codex"
+          : "Kimi"
+    );
+  p.note(
+    [
+      `${pc.bold("Projects")}  ${selected.map((repo) => repo.label).join(", ")}`,
+      `${pc.bold("Found")}     ${tools.length > 0 ? tools.join(" + ") : "supported session files"}`,
+      "",
+      "Vibecom will import token counters and build activity already on",
+      "this computer, then keep these projects up to date.",
+      "",
+      pc.dim("Activity totals only. Never your code or prompts."),
+      pc.dim("You can change this anytime with vibecom."),
+    ].join("\n"),
+    "ready to connect"
+  );
+
+  const proceed = orExit(
+    await p.confirm({
+      message: "Connect and import my activity?",
+      initialValue: true,
+    })
+  );
+  if (!proceed) {
+    p.log.info("Skipped. Nothing was changed or collected.");
+    return 0;
+  }
+
+  if (!(await reviewOwnership(selected, cred, origin))) return 0;
+  const count = await applyLinks(cred, origin, selected, 1);
+  if (count === 0) return 0;
+
+  const scan = await pulse("importing your existing activity", runScan());
+  for (const failure of scan.failed) p.log.warn(failure);
+  p.note(
+    [
+      scan.sessions > 0
+        ? `${pc.green("✔")} Imported ${scan.sessions} coding session${scan.sessions === 1 ? "" : "s"}.`
+        : `${pc.green("✔")} Connected. Your first activity will appear automatically.`,
+      tools.length > 0 ? `${pc.green("✔")} Tracking ${tools.join(" + ")}.` : "",
+      "",
+      pc.dim("Your code, prompts, and file paths never leave this computer."),
+    ].filter(Boolean).join("\n"),
+    "you're live"
+  );
   return count;
 }
 
@@ -800,7 +870,7 @@ async function wizard() {
   // First run with nothing linked goes straight into connecting.
   if (listSlots().length === 0) {
     const here = projectRoot();
-    await runLink(cred, here ? path.dirname(here) : process.cwd());
+    await quickStart(cred, here ? path.dirname(here) : process.cwd());
   }
 
   while (await menu(cred));

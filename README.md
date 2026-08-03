@@ -46,9 +46,9 @@ the wire that the document does not list — or if the document claims one the
 code never sends.
 
 > [!IMPORTANT]
-> Installing collects nothing. It does not touch your shell profile.
-> Collection begins only when you run `vibecom link` **inside a specific
-> repository**, and applies only to that repository.
+> Installing and signing in collect nothing. Guided setup recommends only
+> personal repositories it can identify safely. Collection begins only after
+> you confirm, and applies only to those repositories.
 
 ---
 

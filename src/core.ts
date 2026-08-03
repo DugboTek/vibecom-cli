@@ -344,6 +344,22 @@ export function copyToClipboard(text: string): boolean {
   return false;
 }
 
+/** Best-effort browser launch. The URL is still printed when unavailable. */
+export function openBrowser(url: string): boolean {
+  const command: [string, string[]] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  try {
+    execFileSync(command[0], command[1], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /* ------- git ------- */
 
 /**
@@ -484,6 +500,33 @@ export function discoverRepos(dir: string): Discovered[] {
   }
 
   return [...new Set(found)].map(describe);
+}
+
+/**
+ * Choose a safe first-run default without asking a beginner to understand
+ * repository ownership. Prefer the repo they intentionally ran from; from a
+ * parent directory, include only remotes owned by their signed-in account.
+ */
+export function recommendedRepos(
+  repos: Discovered[],
+  username: string,
+  currentRoot: string | null
+): Discovered[] {
+  const available = repos.filter((repo) => !repo.linked);
+  const current = currentRoot
+    ? available.find((repo) => repo.root === currentRoot)
+    : undefined;
+  if (
+    current &&
+    (!current.owner ||
+      current.owner.toLowerCase() === username.toLowerCase() ||
+      isTrusted(current.owner))
+  ) {
+    return [current];
+  }
+  return available.filter(
+    (repo) => repo.owner?.toLowerCase() === username.toLowerCase()
+  );
 }
 
 /* ------- claude code project settings ------- */

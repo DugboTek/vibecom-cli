@@ -15,6 +15,7 @@ import {
   readProjectToken,
   uncoveredWorktrees,
   projectIdFor,
+  recommendedRepos,
   remoteOwner,
   removeProjectSettings,
   settingsPathFor,
@@ -66,6 +67,31 @@ test("remoteOwner parses ssh, https, and .git forms", () => {
   for (const [remote, expected] of cases) {
     assert.equal(remoteOwner(remote), expected, remote);
   }
+});
+
+test("onboarding recommends the current personal repo without extra choices", () => {
+  const current = {
+    root: "/code/mine",
+    label: "mine",
+    owner: "octocat",
+    remote: "https://github.com/octocat/mine",
+    linked: null,
+    worktrees: ["/code/mine"],
+  };
+  const client = { ...current, root: "/code/client", label: "client", owner: "acme" };
+  assert.deepEqual(recommendedRepos([current, client], "OctoCat", current.root), [current]);
+});
+
+test("onboarding never auto-selects another owner's repository", () => {
+  const client = {
+    root: "/code/client",
+    label: "client",
+    owner: "acme",
+    remote: "https://github.com/acme/client",
+    linked: null,
+    worktrees: ["/code/client"],
+  };
+  assert.deepEqual(recommendedRepos([client], "octocat", null), []);
 });
 
 /* ------- project settings ------- */
