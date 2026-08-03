@@ -6,6 +6,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 import {
+  commonGitDir,
   ensureExcluded,
   ensureGitignored,
   gitRoot,
@@ -17,6 +18,7 @@ import {
   remoteOwner,
   removeProjectSettings,
   settingsPathFor,
+  secureOrigin,
   writeProjectSettings,
 } from "./core";
 
@@ -91,6 +93,26 @@ test("the token file is not world-readable", () => {
   assert.equal(mode, 0o600, `expected 0600, got ${mode.toString(8)}`);
 });
 
+test("an existing permissive token file is replaced with mode 0600", () => {
+  const dir = repo("perms-existing");
+  const file = settingsPathFor(dir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "{}");
+  fs.chmodSync(file, 0o644);
+
+  writeProjectSettings(dir, "https://vibecom.build", "tok_secret");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+test("credential-bearing configuration rejects HTTP origins and URL userinfo", () => {
+  const dir = repo("origin");
+  assert.throws(
+    () => writeProjectSettings(dir, "http://vibecom.build", "tok"),
+    /HTTPS/
+  );
+  assert.throws(() => secureOrigin("https://user:pass@vibecom.build"), /userinfo/);
+});
+
 test("existing unrelated settings survive linking and unlinking", () => {
   const dir = repo("merge");
   const file = settingsPathFor(dir);
@@ -130,12 +152,48 @@ test("corrupt settings.local.json does not throw or lose the link", () => {
   assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "1");
 });
 
+test("settings writes refuse symlinked paths", () => {
+  const dir = repo("settings-symlink");
+  const outside = path.join(tmp, "outside-settings.json");
+  fs.writeFileSync(outside, '{"outside":true}');
+  const claude = path.join(dir, ".claude");
+  fs.mkdirSync(claude);
+  fs.symlinkSync(outside, path.join(claude, "settings.local.json"));
+
+  assert.throws(() => writeProjectSettings(dir, "https://vibecom.build", "tok"), /regular/);
+  assert.equal(fs.readFileSync(outside, "utf8"), '{"outside":true}');
+});
+
+test("settings writes refuse a symlinked .claude directory", () => {
+  const dir = repo("claude-directory-symlink");
+  const outside = path.join(tmp, "outside-claude");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dir, ".claude"));
+
+  assert.throws(() => writeProjectSettings(dir, "https://vibecom.build", "tok"), /non-directory/);
+  assert.equal(fs.readdirSync(outside).length, 0);
+});
+
+test("tracked settings files never receive credentials", () => {
+  const dir = repo("tracked-settings");
+  const file = settingsPathFor(dir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "{}");
+  execFileSync("git", ["add", "-f", ".claude/settings.local.json"], {
+    cwd: dir,
+    stdio: "ignore",
+  });
+
+  assert.throws(() => writeProjectSettings(dir, "https://vibecom.build", "tok"), /Git-tracked/);
+  assert.equal(fs.readFileSync(file, "utf8"), "{}");
+});
+
 /* ------- gitignore ------- */
 
 test("the token file is gitignored, and git agrees", () => {
   const dir = repo("ignored");
   writeProjectSettings(dir, "https://vibecom.build", "tok");
-  assert.equal(ensureGitignored(dir), true, "should have added the rule");
+  assert.equal(ensureGitignored(dir), true, "should add the tracked guard too");
 
   const tracked = execFileSync("git", ["status", "--porcelain"], {
     cwd: dir,
@@ -166,6 +224,30 @@ test("an existing .gitignore without a trailing newline is not corrupted", () =>
     .filter(Boolean);
   assert.ok(lines.includes("dist"), "clobbered the existing rule");
   assert.ok(lines.includes(".claude/settings.local.json"));
+});
+
+test("gitignore symlinks are not followed", () => {
+  const dir = repo("gitignore-symlink");
+  const outside = path.join(tmp, "outside-gitignore");
+  fs.writeFileSync(outside, "keep");
+  fs.symlinkSync(outside, path.join(dir, ".gitignore"));
+
+  assert.throws(() => ensureGitignored(dir), /non-regular/);
+  assert.equal(fs.readFileSync(outside, "utf8"), "keep");
+});
+
+test("a hostile gitignore fails before any token file is written", () => {
+  const dir = repo("gitignore-preflight");
+  const outside = path.join(tmp, "outside-preflight");
+  fs.writeFileSync(outside, "keep");
+  fs.symlinkSync(outside, path.join(dir, ".gitignore"));
+
+  assert.throws(
+    () => writeProjectSettings(dir, "https://vibecom.build", "tok"),
+    /non-regular/
+  );
+  assert.equal(fs.existsSync(settingsPathFor(dir)), false);
+  assert.equal(fs.readFileSync(outside, "utf8"), "keep");
 });
 
 /* ------- git worktrees ------- */
@@ -258,4 +340,16 @@ test("info/exclude covers every worktree without needing a commit", () => {
     !dirty.includes("settings.local.json"),
     `git can see the token file inside the worktree:\n${dirty}`
   );
+});
+
+test("info/exclude symlinks are not followed", () => {
+  const dir = repo("exclude-symlink");
+  const outside = path.join(tmp, "outside-exclude");
+  fs.writeFileSync(outside, "keep");
+  const exclude = path.join(commonGitDir(dir)!, "info", "exclude");
+  fs.rmSync(exclude, { force: true });
+  fs.symlinkSync(outside, exclude);
+
+  ensureExcluded(dir);
+  assert.equal(fs.readFileSync(outside, "utf8"), "keep");
 });

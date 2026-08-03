@@ -52,7 +52,57 @@ function readJson<T>(file: string, fallback: T): T {
 
 function writeJson(file: string, value: unknown) {
   ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  writePrivateFile(file, JSON.stringify(value, null, 2) + "\n");
+}
+
+/** Replace a file atomically without following the destination entry. */
+function writeAtomicFile(file: string, body: string, mode: number) {
+  const dir = path.dirname(file);
+  const tmp = path.join(
+    dir,
+    `.${path.basename(file)}.${randomBytes(12).toString("hex")}.tmp`
+  );
+  try {
+    fs.writeFileSync(tmp, body, { encoding: "utf8", mode, flag: "wx" });
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, file);
+    fs.chmodSync(file, mode);
+  } catch (error) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Preserve the original error; failure to clean a private temp file is
+      // not more actionable here.
+    }
+    throw error;
+  }
+}
+
+/** Write sensitive configuration without ever leaving a partial/public file. */
+function writePrivateFile(file: string, body: string) {
+  writeAtomicFile(file, body, 0o600);
+}
+
+/** Only use origins on a transport that cannot disclose bearer credentials. */
+export function secureOrigin(origin: string): string {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new ApiError("origin must be an absolute HTTPS URL");
+  }
+  if (
+    url.protocol !== "https:" ||
+    !url.hostname ||
+    url.username ||
+    url.password ||
+    (url.pathname !== "/" && url.pathname !== "") ||
+    url.search ||
+    url.hash
+  ) {
+    throw new ApiError("origin must be an HTTPS origin without userinfo or a path");
+  }
+  return url.origin;
 }
 
 /* ------- credentials ------- */
@@ -64,7 +114,8 @@ export const readCredentials = (): Credentials | null => {
   return readJson<Credentials | null>(CRED_FILE, null);
 };
 
-export const writeCredentials = (c: Credentials) => writeJson(CRED_FILE, c);
+export const writeCredentials = (c: Credentials) =>
+  writeJson(CRED_FILE, { ...c, origin: secureOrigin(c.origin) });
 export const clearCredentials = () => fs.rmSync(CRED_FILE, { force: true });
 
 /**
@@ -73,15 +124,17 @@ export const clearCredentials = () => fs.rmSync(CRED_FILE, { force: true });
  * downloaded from. Explicit env var always wins.
  */
 export function resolveOrigin(): string {
-  if (process.env.VIBECOM_ORIGIN) return process.env.VIBECOM_ORIGIN;
-  if (process.env.VIBELAND_ORIGIN) return process.env.VIBELAND_ORIGIN;
+  if (process.env.VIBECOM_ORIGIN) return secureOrigin(process.env.VIBECOM_ORIGIN);
+  if (process.env.VIBELAND_ORIGIN) return secureOrigin(process.env.VIBELAND_ORIGIN);
   const cred = readCredentials();
-  if (cred?.origin) return cred.origin;
+  if (cred?.origin) return secureOrigin(cred.origin);
+  let savedOrigin: string;
   try {
-    return fs.readFileSync(ORIGIN_FILE, "utf8").trim();
+    savedOrigin = fs.readFileSync(ORIGIN_FILE, "utf8").trim();
   } catch {
     return "https://vibecom.build";
   }
+  return secureOrigin(savedOrigin);
 }
 
 /* ------- trusted repo owners ------- */
@@ -187,6 +240,10 @@ export type ScanMark = {
   lines: number;
   mtimeMs: number;
   root?: string;
+  /** Same reasoning as `root`: Codex names the model on turn_context, near the
+      top of the file. An incremental re-read starts past it, so a continuing
+      session would lose its model on every scan after the first. */
+  model?: string | null;
 };
 
 /** `tool:sessionId` -> what has already been sent for it. */
@@ -436,8 +493,8 @@ export function writeProjectSettings(
   origin: string,
   token: string
 ): string {
-  const file = settingsPathFor(root);
-  ensureDir(path.dirname(file));
+  origin = secureOrigin(origin);
+  const file = prepareProjectSettings(root);
   const data = readJson<Record<string, unknown>>(file, {});
   const env = (
     typeof data.env === "object" && data.env !== null ? data.env : {}
@@ -454,13 +511,39 @@ export function writeProjectSettings(
     OTEL_LOG_USER_PROMPTS: "0",
   });
   data.env = env;
-  writeJson(file, data);
+  writePrivateFile(file, JSON.stringify(data, null, 2) + "\n");
+  return file;
+}
+
+/** Establish and verify ignore/tracking invariants before a token is minted. */
+export function prepareProjectSettings(root: string): string {
+  const canonicalRoot = realpath(root);
+  const file = safeSettingsPath(canonicalRoot, true);
+  if (isGitTracked(canonicalRoot, IGNORE_PATTERN)) {
+    throw new Error("refusing to write an ingest token to a Git-tracked settings file");
+  }
+  // A hostile entry must fail preflight even when info/exclude already covers
+  // the path; otherwise a later gitignore update could fail after the write.
+  inspectGitignore(canonicalRoot);
+  ensureExcluded(canonicalRoot);
+  if (!isGitIgnored(canonicalRoot, IGNORE_PATTERN)) {
+    ensureGitignored(canonicalRoot);
+  }
+  if (!isGitIgnored(canonicalRoot, IGNORE_PATTERN)) {
+    throw new Error("refusing to write an ingest token without a verified Git ignore rule");
+  }
   return file;
 }
 
 /** The ingest token already written into a checkout, if any. */
 export function readProjectToken(root: string): string | null {
-  const data = readJson<Record<string, unknown>>(settingsPathFor(root), {});
+  let file: string;
+  try {
+    file = safeSettingsPath(root, false);
+  } catch {
+    return null;
+  }
+  const data = readJson<Record<string, unknown>>(file, {});
   const env = data.env as Record<string, string> | undefined;
   const header = env?.OTEL_EXPORTER_OTLP_HEADERS;
   const match = header?.match(/Bearer\s+(\S+)/);
@@ -476,7 +559,7 @@ export function uncoveredWorktrees(root: string): string[] {
 }
 
 export function removeProjectSettings(root: string) {
-  const file = settingsPathFor(root);
+  const file = safeSettingsPath(root, false);
   if (!fs.existsSync(file)) return;
   const data = readJson<Record<string, unknown>>(file, {});
   const env = data.env as Record<string, string> | undefined;
@@ -484,7 +567,62 @@ export function removeProjectSettings(root: string) {
     for (const key of OTEL_KEYS) delete env[key];
     if (Object.keys(env).length === 0) delete data.env;
   }
-  writeJson(file, data);
+  writePrivateFile(file, JSON.stringify(data, null, 2) + "\n");
+}
+
+/**
+ * Do not follow a repository-controlled link when reading or writing a token.
+ * The root itself may be a user-facing symlink, so canonicalize it first; the
+ * `.claude` directory and settings file themselves must be ordinary entries.
+ */
+function safeSettingsPath(root: string, createDirectory: boolean): string {
+  const canonicalRoot = realpath(root);
+  const claudeDir = path.join(canonicalRoot, ".claude");
+  try {
+    const stat = fs.lstatSync(claudeDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("refusing to use a non-directory .claude path");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (!createDirectory) return path.join(claudeDir, "settings.local.json");
+    fs.mkdirSync(claudeDir, { recursive: false, mode: 0o700 });
+  }
+
+  const file = path.join(claudeDir, "settings.local.json");
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error("refusing to use a non-regular settings.local.json file");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return file;
+}
+
+function isGitTracked(root: string, relativePath: string): boolean {
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", "--", relativePath], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isGitIgnored(root: string, relativePath: string): boolean {
+  try {
+    execFileSync("git", ["check-ignore", "-q", "--no-index", "--", relativePath], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const IGNORE_PATTERN = ".claude/settings.local.json";
@@ -503,6 +641,19 @@ export function ensureExcluded(cwd: string): void {
   if (!common) return;
   const file = path.join(common, "info", "exclude");
   try {
+    const info = path.dirname(file);
+    try {
+      const stat = fs.lstatSync(info);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+      fs.mkdirSync(info, { recursive: true, mode: 0o700 });
+    }
+    try {
+      if (fs.lstatSync(file).isSymbolicLink()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
     let current = "";
     try {
       current = fs.readFileSync(file, "utf8");
@@ -510,10 +661,10 @@ export function ensureExcluded(cwd: string): void {
       /* no info/exclude yet */
     }
     if (current.split("\n").some((l) => l.trim() === IGNORE_PATTERN)) return;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(
+    writeAtomicFile(
       file,
-      `${current && !current.endsWith("\n") ? "\n" : ""}# vibecom: contains an ingest token, do not commit\n${IGNORE_PATTERN}\n`
+      `${current}${current && !current.endsWith("\n") ? "\n" : ""}# vibecom: contains an ingest token, do not commit\n${IGNORE_PATTERN}\n`,
+      0o600
     );
   } catch {
     /* read-only or unusual git dir — .gitignore still covers the common case */
@@ -521,19 +672,39 @@ export function ensureExcluded(cwd: string): void {
 }
 
 /** Returns true when the ignore rule had to be added. */
-export function ensureGitignored(root: string): boolean {
-  const file = path.join(root, ".gitignore");
-  const pattern = IGNORE_PATTERN;
+function inspectGitignore(root: string): {
+  file: string;
+  current: string;
+  mode: number;
+} {
+  const file = path.join(realpath(root), ".gitignore");
   let current = "";
+  let mode = 0o644;
   try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error("refusing to update a non-regular .gitignore file");
+    }
+    mode = stat.mode & 0o777;
     current = fs.readFileSync(file, "utf8");
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
     /* no .gitignore yet */
   }
+  return { file, current, mode };
+}
+
+/** Returns true when the ignore rule had to be added. */
+export function ensureGitignored(root: string): boolean {
+  const { file, current, mode } = inspectGitignore(root);
+  const pattern = IGNORE_PATTERN;
   if (current.split("\n").some((line) => line.trim() === pattern)) return false;
-  fs.appendFileSync(
+  writeAtomicFile(
     file,
-    `${current && !current.endsWith("\n") ? "\n" : ""}\n# vibecom: contains an ingest token, do not commit\n${pattern}\n`
+    `${current}${current && !current.endsWith("\n") ? "\n" : ""}\n# vibecom: contains an ingest token, do not commit\n${pattern}\n`,
+    mode
   );
   return true;
 }
@@ -557,6 +728,7 @@ async function request<T>(
   init: RequestInit = {},
   attempt = 0
 ): Promise<T> {
+  origin = secureOrigin(origin);
   let res: Response;
   try {
     res = await fetch(origin + route, init);
@@ -661,6 +833,7 @@ export const BUILD: string =
 export async function selfUpdate(
   origin: string
 ): Promise<{ updated: boolean; build: string }> {
+  origin = secureOrigin(origin);
   const target = realpath(process.argv[1]);
   let res: Response;
   try {

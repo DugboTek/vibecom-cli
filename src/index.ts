@@ -30,6 +30,7 @@ import {
   mintProjectToken,
   newSalt,
   pollDeviceToken,
+  prepareProjectSettings,
   projectIdFor,
   readCredentials,
   readSlot,
@@ -295,6 +296,20 @@ async function applyLinks(
     spin.start(`linking ${repo.label}`);
     const salt = repo.linked?.salt ?? newSalt();
     const projectId = projectIdFor(salt, repo.root);
+    const trees = listWorktrees(repo.root);
+    let added = false;
+    try {
+      // Establish and verify ignore protection before the server creates a
+      // bearer token or any checkout receives it.
+      added = ensureGitignored(repo.root);
+      ensureExcluded(repo.root);
+      for (const tree of trees) prepareProjectSettings(tree);
+    } catch (error) {
+      spin.stop(
+        bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
+      );
+      continue;
+    }
     let token: string;
     try {
       token = (
@@ -313,10 +328,15 @@ async function applyLinks(
        gitignored, so `git worktree add` never copies it — and agent tools do
        all their work in worktrees. Covering only the main checkout would mean
        tracking almost nothing, silently. */
-    const trees = listWorktrees(repo.root);
-    for (const tree of trees) writeProjectSettings(tree, origin, token);
-    const added = ensureGitignored(repo.root);
-    ensureExcluded(repo.root);
+    try {
+      for (const tree of trees) writeProjectSettings(tree, origin, token);
+    } catch (error) {
+      await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
+      spin.stop(
+        bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
+      );
+      continue;
+    }
     writeSlot({
       root: repo.root,
       salt,
@@ -528,6 +548,7 @@ async function runScan(): Promise<{
       continue; // unchanged since last scan
     }
 
+    if (!usage.model && mark?.model) usage.model = mark.model;
     const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
     const root = cwd ? projectRoot(cwd) : null;
     const slot = root
@@ -567,7 +588,7 @@ async function runScan(): Promise<{
       delta.cacheReadTokens +
       delta.cacheCreationTokens;
     if (total === 0) {
-      marks[key] = markFor(usage, slot.root);
+      marks[key] = markFor(usage, slot.root, mark?.model);
       continue;
     }
     byProject.set(slot.root, [
@@ -608,7 +629,7 @@ async function runScan(): Promise<{
 }
 
 /** Record the session totals now known to be on the server. */
-function markFor(u: SessionUsage, root: string) {
+function markFor(u: SessionUsage, root: string, model?: string | null) {
   return {
     turns: u.turns,
     inputTokens: u.inputTokens,
@@ -620,6 +641,7 @@ function markFor(u: SessionUsage, root: string) {
     lines: u.lines,
     mtimeMs: u.mtimeMs,
     root,
+    model: u.model ?? model ?? null,
   };
 }
 
