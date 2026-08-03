@@ -1,10 +1,11 @@
 {
   "name": "vibecom-cli",
   "version": "0.1.0",
-  "description": "The vibecom CLI — reads coding-session counters off disk and sends only what COLLECTION.md documents.",
+  "description": "The vibecom CLI \u2014 reads coding-session counters off disk and sends only what COLLECTION.md documents.",
   "license": "MIT",
-  "bin": { "vibecom": "dist/cli.js" },
-  "type": "module",
+  "bin": {
+    "vibecom": "dist/cli.js"
+  },
   "scripts": {
     "build": "node build.mjs",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
@@ -17,5 +18,7 @@
     "tsx": "^4.23.1",
     "typescript": "^5"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }
