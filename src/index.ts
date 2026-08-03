@@ -472,7 +472,14 @@ function reportSync(healed: ReturnType<typeof syncWorktrees>) {
  * A session is only sent if its working directory belongs to a project you
  * have linked. Everything else on disk is ignored.
  */
-async function runScan(): Promise<{
+/**
+ * `full` re-reads every transcript from the beginning and restates each
+ * session rather than sending what has changed since the last run. It exists
+ * because the first imports stamped rows with the time they were uploaded, so
+ * the only way to correct them is to send them again — which is safe only if
+ * the server replaces the session instead of adding to it.
+ */
+async function runScan(full = false): Promise<{
   sent: number;
   sessions: number;
   skipped: number;
@@ -538,8 +545,9 @@ async function runScan(): Promise<{
   for (const [key, group] of groups) {
     const usage = group.best;
     if (!usage) continue;
-    const mark = marks[key];
+    const mark = full ? undefined : marks[key];
     if (
+      !full &&
       mark &&
       mark.file === usage.file &&
       mark.lines === usage.lines &&
@@ -612,7 +620,8 @@ async function runScan(): Promise<{
         const res = await sendScanned(
           slot.origin,
           token,
-          batch.map((b) => ({ ...b.delta, endedAtMs: b.usage.mtimeMs }))
+          batch.map((b) => ({ ...b.delta, endedAtMs: b.usage.mtimeMs })),
+          full
         );
         sent += res.accepted;
         sessions += batch.length;
@@ -944,6 +953,7 @@ async function help() {
     ["status", "linked projects and trusted owners"],
     ["sync", "cover worktrees created since linking"],
     ["scan", "import usage from running + past sessions"],
+    ["rescan", "re-import everything, correcting old timestamps"],
     ["update", "pull the newest CLI from your server"],
     ["unlink", "stop collecting from this repo"],
     ["trust <owner>", "allow repos under an org you control"],
@@ -993,6 +1003,39 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       r.updated ? `updated to build ${r.build}` : "already on the latest build"
     );
     p.outro(pc.dim(`current build ${BUILD}`));
+  },
+  /**
+   * Re-import every session from scratch, restating each one rather than
+   * adding to it. Needed because early imports dated rows when they were
+   * uploaded rather than when the work happened; the server replaces each
+   * session it receives here, so running it twice changes nothing.
+   */
+  rescan: async () => {
+    requireLogin();
+    p.intro(gradient("  rescan  "));
+    p.log.step(
+      "re-reading every transcript and restating each session"
+    );
+    console.log(
+      bullet(
+        pc.dim("totals are replaced, not added — safe to run more than once")
+      )
+    );
+    const r = await pulse("re-importing full history", runScan(true));
+    if (r.sessions === 0) {
+      p.log.warn("no sessions found — is anything linked?");
+    } else {
+      p.log.success(
+        `${r.sessions} session(s) restated — ${r.sent} rows accepted`
+      );
+    }
+    for (const f of r.failed) p.log.warn(f);
+    if (r.skipped > 0) {
+      console.log(
+        bullet(pc.dim(`${r.skipped} session(s) in unlinked projects — ignored`))
+      );
+    }
+    p.outro(pc.dim("your calendar and clock now reflect when you worked"));
   },
   scan: async () => {
     requireLogin();

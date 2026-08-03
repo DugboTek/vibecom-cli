@@ -270,7 +270,13 @@ export async function sendScanned(
     costUsd: number;
     /** When the session last wrote to disk, ms since epoch. */
     endedAtMs?: number;
-  }[]
+  }[],
+  /**
+   * Restate each session in full instead of adding to it. The server drops
+   * whatever it holds for the session first, which makes re-importing safe:
+   * without it a rescan would double every total it touched.
+   */
+  replace = false
 ): Promise<{ accepted: number; dropped: number }> {
   const attr = (key: string, value: string | number) => ({
     key,
@@ -298,6 +304,7 @@ export async function sendScanned(
       ...(s.endedAtMs && Number.isFinite(s.endedAtMs)
         ? [attr("ended_at", new Date(s.endedAtMs).toISOString())]
         : []),
+      ...(replace ? [attr("replace", "true")] : []),
     ],
   }));
 

@@ -43,6 +43,7 @@ One record per coding session, to `POST /api/v1/logs`:
 | `cache_read_tokens` | number | Sum of cache-read tokens |
 | `cache_creation_tokens` | number | Sum of cache-write tokens |
 | `cost_usd` | number | Cost as reported by the tool itself |
+| `replace` | string | Present only during `vibecom rescan`. Tells the server to restate this session rather than add to it, so re-importing cannot double your totals |
 | `ended_at` | string | When the session last wrote to disk (ISO 8601), so activity is dated when it happened rather than when it was uploaded. Omitted if unknown |
 
 That is the entire payload. See `sendScanned()` in `src/core.ts`.
@@ -85,6 +86,17 @@ repository**, and applies only to that repository. An earlier version of the
 installer exported OTLP variables globally, which turned collection on for every
 repo on the machine including employers'. That was removed; see the note at the
 top of the installer.
+
+## Re-importing history
+
+`vibecom rescan` re-reads every transcript from the beginning and restates each
+session in full. The server drops what it already holds for a session before
+storing the new figures, so running it twice changes nothing — it cannot
+inflate your totals.
+
+Use it if your activity is dated wrongly: imports made before `ended_at`
+existed were stamped with the time of upload, so months of work appeared as a
+single busy hour.
 
 ## Consent tiers
 
