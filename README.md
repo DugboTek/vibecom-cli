@@ -24,7 +24,7 @@ repository.
 Prefer not to pipe a script into bash? Build it yourself:
 
 ```bash
-git clone https://github.com/chrismicah/vibecom-cli
+git clone https://github.com/DugboTek/vibecom-cli
 cd vibecom-cli && npm install && npm run build
 install -m 755 dist/cli.js ~/.local/bin/vibecom
 ```
