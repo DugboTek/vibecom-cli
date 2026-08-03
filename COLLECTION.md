@@ -29,11 +29,12 @@ appears anywhere in the output.
 
 ## Exactly what is sent
 
-One record per coding session, to `POST /api/v1/logs`:
+One summary record per coding session plus one active-time counter for each UTC
+hour the session occupied, to `POST /api/v1/logs`:
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `event.name` | string | Always `vibecom.session` |
+| `event.name` | string | `vibecom.session` for the summary or `vibecom.session.activity` for an hourly active-time counter |
 | `tool` | string | `claude-code`, `codex`, `opencode`, or `kimi` |
 | `session.id` | string | The tool's own session id, or the transcript filename |
 | `model` | string | Model name, e.g. `claude-opus-5`, `gpt-5.6-sol`. Omitted if the transcript does not record one |
@@ -43,15 +44,20 @@ One record per coding session, to `POST /api/v1/logs`:
 | `cache_read_tokens` | number | Sum of cache-read tokens |
 | `cache_creation_tokens` | number | Sum of cache-write tokens |
 | `cost_usd` | number | Cost as reported by the tool itself |
-| `replace` | string | Present only during `vibecom rescan`. Tells the server to restate this session rather than add to it, so re-importing cannot double your totals |
-| `ended_at` | string | When the session last wrote to disk (ISO 8601), so activity is dated when it happened rather than when it was uploaded. Omitted if unknown |
+| `replace` | string | `true` when the record restates the session. The server replaces the prior copy, so a growing chat or re-import cannot double totals |
+| `started_at` | string | First timestamp recorded inside the transcript (ISO 8601). Omitted when the format does not expose one |
+| `ended_at` | string | Last timestamp recorded inside the transcript (ISO 8601), with file modification time used only for older formats that do not timestamp enough records |
+| `bucket_at` | string | Start of a UTC hour containing derived active time (ISO 8601). Present only on `vibecom.session.activity` records |
+| `active_seconds` | number | Active seconds in that hour. Derived from gaps between transcript events; gaps over 15 minutes contribute at most 15 minutes |
 
 That is the entire payload. See `sendScanned()` in `src/core.ts`.
 
-`ended_at` is the transcript file's modification time — not a clock reading from
-inside your session, and not tied to any file path. Without it every imported
-session would be stamped with the moment you ran `vibecom scan`, which made a
-month of history look like a single hour of work.
+`started_at`, `ended_at`, and the hourly active counters come from timestamps
+already present on transcript records. They contain no transcript content and
+are not tied to a file path. Long idle gaps are capped locally at 15 minutes,
+so leaving a chat open overnight does not count the whole night as work.
+Without the hourly counters, an imported three-hour session would still be
+drawn as one spike at the moment it ended.
 
 Two more values are attached **by the server**, from the token you authenticated
 with rather than from anything the CLI claims:
@@ -89,14 +95,14 @@ top of the installer.
 
 ## Re-importing history
 
-`vibecom rescan` re-reads every transcript from the beginning and restates each
-session in full. The server drops what it already holds for a session before
-storing the new figures, so running it twice changes nothing — it cannot
-inflate your totals.
+Scans restate each changed session in full. The server drops what it already
+holds for that session before storing the new figures, so a growing session or
+re-import cannot inflate totals. `vibecom rescan` forces this for every linked
+historical session, including unchanged sessions.
 
-Use it if your activity is dated wrongly: imports made before `ended_at`
-existed were stamped with the time of upload, so months of work appeared as a
-single busy hour.
+Use it to backfill the duration-aware clock for old history. Imports made before
+session event times existed were stamped only at their upload or end time, so
+hours of work could appear as a single busy spike.
 
 ## Consent tiers
 

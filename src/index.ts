@@ -543,13 +543,14 @@ function reportSync(healed: ReturnType<typeof syncWorktrees>) {
  * have linked. Everything else on disk is ignored.
  */
 /**
- * `full` re-reads every transcript from the beginning and restates each
- * session rather than sending what has changed since the last run. It exists
- * because the first imports stamped rows with the time they were uploaded, so
- * the only way to correct them is to send them again — which is safe only if
- * the server replaces the session instead of adding to it.
+ * Every changed session is restated so counters and duration buckets stay one
+ * coherent snapshot. `full` bypasses the unchanged-session marks as well,
+ * which backfills historical sessions whose old rows predate event timing.
  */
-async function runScan(full = false): Promise<{
+async function runScan(
+  full = false,
+  progress?: { label: string }
+): Promise<{
   sent: number;
   sessions: number;
   skipped: number;
@@ -568,13 +569,24 @@ async function runScan(full = false): Promise<{
      Claude Code writes a fresh transcript on every resume and replays the
      prior history into it, so one session can span 149 files each containing a
      superset of the last. Summing them inflated real usage by ~21x. The
-     authoritative record for a session is its most complete transcript, and
-     what we owe the server is the delta against what we already sent. */
+     authoritative record for a session is its most complete transcript, which
+     is what we restate whenever that session changes. */
   type Group = { tool: string; sessionId: string; best: SessionUsage | null };
   const groups = new Map<string, Group>();
 
-  for (const source of transcriptSources()) {
-    for (const file of source.files) {
+  const allFiles = transcriptSources().flatMap((source) =>
+    source.files.map((file) => ({ source, file }))
+  );
+  let read = 0;
+  for (const { source, file } of allFiles) {
+    read += 1;
+    if (progress && read % 40 === 0) {
+      progress.label = `reading transcripts — ${read}/${allFiles.length}`;
+      /* Hand the loop back so the spinner can paint. Scanning is synchronous
+         file I/O across thousands of transcripts and would otherwise hold the
+         event loop for the whole run, which is why it looked frozen. */
+      await new Promise((resolve) => setImmediate(resolve));
+    }
       let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
@@ -606,9 +618,8 @@ async function runScan(full = false): Promise<{
       }
       groups.set(key, group);
     }
-  }
 
-  const byProject = new Map<string, { usage: SessionUsage; key: string; delta: SessionUsage }[]>();
+  const byProject = new Map<string, { usage: SessionUsage; key: string }[]>();
   let skipped = 0;
   const byTool: Record<string, number> = {};
 
@@ -619,6 +630,7 @@ async function runScan(full = false): Promise<{
     if (
       !full &&
       mark &&
+      mark.activityVersion === 1 &&
       mark.file === usage.file &&
       mark.lines === usage.lines &&
       mark.mtimeMs === usage.mtimeMs
@@ -642,36 +654,24 @@ async function runScan(full = false): Promise<{
       continue;
     }
 
-    // send only what is new since the last scan of this session
-    const delta: SessionUsage = {
-      ...usage,
-      turns: Math.max(0, usage.turns - (mark?.turns ?? 0)),
-      inputTokens: Math.max(0, usage.inputTokens - (mark?.inputTokens ?? 0)),
-      outputTokens: Math.max(0, usage.outputTokens - (mark?.outputTokens ?? 0)),
-      cacheReadTokens: Math.max(
-        0,
-        usage.cacheReadTokens - (mark?.cacheReadTokens ?? 0)
-      ),
-      cacheCreationTokens: Math.max(
-        0,
-        usage.cacheCreationTokens - (mark?.cacheCreationTokens ?? 0)
-      ),
-      costUsd: Math.max(0, usage.costUsd - (mark?.costUsd ?? 0)),
-      root: slot.root,
-    };
+    /* Duration-aware imports restate the whole changed session. That lets the
+       server replace both counters and hour buckets together, instead of
+       trying to subtract an evolving time histogram on the client. */
     const total =
-      delta.turns +
-      delta.inputTokens +
-      delta.outputTokens +
-      delta.cacheReadTokens +
-      delta.cacheCreationTokens;
+      usage.turns +
+      usage.inputTokens +
+      usage.outputTokens +
+      usage.cacheReadTokens +
+      usage.cacheCreationTokens +
+      usage.costUsd +
+      usage.activity.reduce((sum, bucket) => sum + bucket.seconds, 0);
     if (total === 0) {
       marks[key] = markFor(usage, slot.root, mark?.model);
       continue;
     }
     byProject.set(slot.root, [
       ...(byProject.get(slot.root) ?? []),
-      { usage, key, delta },
+      { usage, key },
     ]);
     byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
   }
@@ -690,8 +690,20 @@ async function runScan(full = false): Promise<{
         const res = await sendScanned(
           slot.origin,
           token,
-          batch.map((b) => ({ ...b.delta, endedAtMs: b.usage.mtimeMs })),
-          full
+          batch.map((b) => ({
+            tool: b.usage.tool,
+            sessionId: b.usage.sessionId,
+            model: b.usage.model,
+            turns: b.usage.turns,
+            inputTokens: b.usage.inputTokens,
+            outputTokens: b.usage.outputTokens,
+            cacheReadTokens: b.usage.cacheReadTokens,
+            cacheCreationTokens: b.usage.cacheCreationTokens,
+            costUsd: b.usage.costUsd,
+            startedAtMs: b.usage.startedAtMs ?? undefined,
+            endedAtMs: b.usage.endedAtMs ?? b.usage.mtimeMs,
+            activity: b.usage.activity,
+          }))
         );
         sent += res.accepted;
         sessions += batch.length;
@@ -721,6 +733,7 @@ function markFor(u: SessionUsage, root: string, model?: string | null) {
     mtimeMs: u.mtimeMs,
     root,
     model: u.model ?? model ?? null,
+    activityVersion: 1 as const,
   };
 }
 
@@ -1091,7 +1104,8 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
         pc.dim("totals are replaced, not added — safe to run more than once")
       )
     );
-    const r = await pulse("re-importing full history", runScan(true));
+    const progress = { label: "re-importing full history" };
+    const r = await pulse(progress, runScan(true, progress));
     if (r.sessions === 0) {
       p.log.warn("no sessions found — is anything linked?");
     } else {
@@ -1110,10 +1124,8 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   scan: async () => {
     requireLogin();
     p.intro(gradient("  scan  "));
-    const r = await pulse(
-      "reading transcripts from Claude Code, Codex and Kimi",
-      runScan()
-    );
+    const progress = { label: "reading transcripts from Claude Code, Codex and Kimi" };
+    const r = await pulse(progress, runScan(false, progress));
     if (r.sessions === 0) {
       p.log.success("nothing new since the last scan");
     } else {

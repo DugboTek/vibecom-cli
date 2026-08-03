@@ -5,6 +5,8 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 import {
+  ACTIVE_GAP_MS,
+  activityFromTimestamps,
   groupBySession,
   kimiWorkspaceHash,
   transcriptSources,
@@ -54,6 +56,44 @@ test("claude code: human turns are counted, tool results are not", () => {
   assert.equal(u.sessionId, "s1");
   assert.equal(u.cwd, "/code/app");
   assert.equal(u.model, "claude-opus-5");
+});
+
+test("claude code: transcript timestamps define the real session span", () => {
+  const file = jsonl("cc-time.jsonl", [
+    {
+      type: "user",
+      sessionId: "timed",
+      cwd: "/code/app",
+      timestamp: "2026-08-03T14:05:00.000Z",
+      message: { content: "start" },
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-08-03T14:25:00.000Z",
+      message: { usage: ccUsage(10, 2) },
+    },
+  ]);
+  const u = parserFor("claude-code")(file, 0)!;
+  assert.equal(u.startedAtMs, Date.parse("2026-08-03T14:05:00.000Z"));
+  assert.ok((u.endedAtMs ?? 0) >= Date.parse("2026-08-03T14:25:00.000Z"));
+  assert.equal(
+    u.activity.reduce((sum, bucket) => sum + bucket.seconds, 0),
+    ACTIVE_GAP_MS / 1000,
+    "a twenty-minute silence is capped at the fifteen-minute activity window"
+  );
+});
+
+test("active time is split across the clock hours it actually occupied", () => {
+  const start = Date.parse("2026-08-03T14:55:00.000Z");
+  const buckets = activityFromTimestamps([start, start + 10 * 60 * 1000]);
+  assert.deepEqual(
+    buckets.map((bucket) => bucket.seconds),
+    [300, 300]
+  );
+  assert.deepEqual(
+    buckets.map((bucket) => new Date(bucket.bucketAtMs).toISOString()),
+    ["2026-08-03T14:00:00.000Z", "2026-08-03T15:00:00.000Z"]
+  );
 });
 
 test("no transcript content survives parsing, from any tool", () => {
@@ -219,6 +259,9 @@ const usage = (o: Partial<SessionUsage>): SessionUsage => ({
   cacheCreationTokens: 0,
   costUsd: 0,
   turns: 0,
+  startedAtMs: null,
+  endedAtMs: null,
+  activity: [],
   lines: 0,
   mtimeMs: 0,
   file: "f",

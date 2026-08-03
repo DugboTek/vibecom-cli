@@ -140,9 +140,16 @@ export function bigCode(code: string): string {
 }
 
 /** Pulse a line while awaiting `work`; clean single-line output when static. */
-export async function pulse<T>(label: string, work: Promise<T>): Promise<T> {
+/** Mutable label so a long job can report where it has got to. */
+export type Progress = { label: string };
+
+export async function pulse<T>(
+  label: string | Progress,
+  work: Promise<T>
+): Promise<T> {
+  const read = () => (typeof label === "string" ? label : label.label);
   if (!canAnimate) {
-    console.log(`  ${label}`);
+    console.log(`  ${read()}`);
     return work;
   }
   let alive = true;
@@ -152,7 +159,7 @@ export async function pulse<T>(label: string, work: Promise<T>): Promise<T> {
   const spin = (async () => {
     for (let f = 0; alive; f++) {
       const dots = ".".repeat(f % 4).padEnd(3);
-      process.stdout.write(`\r  ${gradient("◆", f / 12)} ${label}${dots}`);
+      process.stdout.write(`\r\x1b[2K  ${gradient("◆", f / 12)} ${read()}${dots}`);
       await sleep(120);
     }
   })();
@@ -160,8 +167,39 @@ export async function pulse<T>(label: string, work: Promise<T>): Promise<T> {
     return await work;
   } finally {
     await spin;
+    /* Clear the line *and* return the cursor, then leave the row usable. The
+       spinner writes with \r and no newline, so anything printed afterwards —
+       a warning about a project that failed — landed on the same row and the
+       output read as one mangled line. */
     process.stdout.write(`\r\x1b[2K`);
   }
+}
+
+/**
+ * Run blocking work without freezing the spinner.
+ *
+ * Scanning is synchronous file I/O across thousands of transcripts, which
+ * holds the event loop and stops any spinner from painting — the command looks
+ * hung. Yielding between units lets the frame render and gives the caller a
+ * place to report progress.
+ */
+export async function withProgress<Item, Result>(
+  items: Item[],
+  each: (item: Item, index: number) => Result,
+  onTick?: (done: number, total: number) => void
+): Promise<Result[]> {
+  const out: Result[] = [];
+  for (let i = 0; i < items.length; i++) {
+    out.push(each(items[i], i));
+    // Every few units is enough to keep the loop responsive without the
+    // yields themselves dominating the run.
+    if (i % 25 === 0) {
+      onTick?.(i + 1, items.length);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  onTick?.(items.length, items.length);
+  return out;
 }
 
 export function tierSwatch(tier: number): string {

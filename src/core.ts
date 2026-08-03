@@ -246,6 +246,8 @@ export type ScanMark = {
       top of the file. An incremental re-read starts past it, so a continuing
       session would lose its model on every scan after the first. */
   model?: string | null;
+  /** Forces one snapshot backfill when duration-aware scanning first ships. */
+  activityVersion?: 1;
 };
 
 /** `tool:sessionId` -> what has already been sent for it. */
@@ -268,15 +270,12 @@ export async function sendScanned(
     cacheReadTokens: number;
     cacheCreationTokens: number;
     costUsd: number;
-    /** When the session last wrote to disk, ms since epoch. */
+    /** First and last event times read from inside the transcript. */
+    startedAtMs?: number;
     endedAtMs?: number;
-  }[],
-  /**
-   * Restate each session in full instead of adding to it. The server drops
-   * whatever it holds for the session first, which makes re-importing safe:
-   * without it a rescan would double every total it touched.
-   */
-  replace = false
+    /** Conservative active seconds already split into UTC clock hours. */
+    activity: { bucketAtMs: number; seconds: number }[];
+  }[]
 ): Promise<{ accepted: number; dropped: number }> {
   const attr = (key: string, value: string | number) => ({
     key,
@@ -286,7 +285,7 @@ export async function sendScanned(
         : { stringValue: value },
   });
 
-  const logRecords = sessions.map((s) => ({
+  const sessionRecords = sessions.map((s) => ({
     attributes: [
       attr("event.name", "vibecom.session"),
       attr("tool", s.tool),
@@ -298,15 +297,33 @@ export async function sendScanned(
       attr("cache_read_tokens", s.cacheReadTokens),
       attr("cache_creation_tokens", s.cacheCreationTokens),
       attr("cost_usd", s.costUsd),
-      /* Without this the server stamps every row with the time of the import,
-         so a scan of months of history collapses onto a single hour and any
-         view of when work happened becomes a picture of when it was uploaded. */
+      ...(s.startedAtMs && Number.isFinite(s.startedAtMs)
+        ? [attr("started_at", new Date(s.startedAtMs).toISOString())]
+        : []),
+      /* These are event times inside the transcript, not the upload time. */
       ...(s.endedAtMs && Number.isFinite(s.endedAtMs)
         ? [attr("ended_at", new Date(s.endedAtMs).toISOString())]
         : []),
-      ...(replace ? [attr("replace", "true")] : []),
+      attr("replace", "true"),
     ],
   }));
+
+  /* A summary row still lands at the session end. These small hourly records
+     are what stop a three-hour chat becoming one spike at scan time. They are
+     derived locally and contain only a timestamp plus a counter. */
+  const activityRecords = sessions.flatMap((s) =>
+    s.activity.map((bucket) => ({
+      attributes: [
+        attr("event.name", "vibecom.session.activity"),
+        attr("tool", s.tool),
+        attr("session.id", s.sessionId),
+        attr("bucket_at", new Date(bucket.bucketAtMs).toISOString()),
+        attr("active_seconds", bucket.seconds),
+        attr("replace", "true"),
+      ],
+    }))
+  );
+  const logRecords = [...sessionRecords, ...activityRecords];
 
   return request<{ accepted: number; dropped: number }>(
     origin,
