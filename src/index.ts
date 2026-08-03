@@ -479,7 +479,10 @@ function reportSync(healed: ReturnType<typeof syncWorktrees>) {
  * the only way to correct them is to send them again — which is safe only if
  * the server replaces the session instead of adding to it.
  */
-async function runScan(full = false): Promise<{
+async function runScan(
+  full = false,
+  progress?: { label: string }
+): Promise<{
   sent: number;
   sessions: number;
   skipped: number;
@@ -503,8 +506,19 @@ async function runScan(full = false): Promise<{
   type Group = { tool: string; sessionId: string; best: SessionUsage | null };
   const groups = new Map<string, Group>();
 
-  for (const source of transcriptSources()) {
-    for (const file of source.files) {
+  const allFiles = transcriptSources().flatMap((source) =>
+    source.files.map((file) => ({ source, file }))
+  );
+  let read = 0;
+  for (const { source, file } of allFiles) {
+    read += 1;
+    if (progress && read % 40 === 0) {
+      progress.label = `reading transcripts — ${read}/${allFiles.length}`;
+      /* Hand the loop back so the spinner can paint. Scanning is synchronous
+         file I/O across thousands of transcripts and would otherwise hold the
+         event loop for the whole run, which is why it looked frozen. */
+      await new Promise((resolve) => setImmediate(resolve));
+    }
       let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
@@ -536,7 +550,6 @@ async function runScan(full = false): Promise<{
       }
       groups.set(key, group);
     }
-  }
 
   const byProject = new Map<string, { usage: SessionUsage; key: string; delta: SessionUsage }[]>();
   let skipped = 0;
@@ -1021,7 +1034,8 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
         pc.dim("totals are replaced, not added — safe to run more than once")
       )
     );
-    const r = await pulse("re-importing full history", runScan(true));
+    const progress = { label: "re-importing full history" };
+    const r = await pulse(progress, runScan(true, progress));
     if (r.sessions === 0) {
       p.log.warn("no sessions found — is anything linked?");
     } else {
@@ -1040,10 +1054,8 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   scan: async () => {
     requireLogin();
     p.intro(gradient("  scan  "));
-    const r = await pulse(
-      "reading transcripts from Claude Code, Codex and Kimi",
-      runScan()
-    );
+    const progress = { label: "reading transcripts from Claude Code, Codex and Kimi" };
+    const r = await pulse(progress, runScan(false, progress));
     if (r.sessions === 0) {
       p.log.success("nothing new since the last scan");
     } else {

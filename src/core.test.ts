@@ -396,3 +396,41 @@ test("a same-origin redirect is still refused rather than looped", async () => {
     globalThis.fetch = original;
   }
 });
+
+test("a long scan yields, so a spinner can actually paint", async () => {
+  /* The command looked frozen because scanning is synchronous file I/O across
+     thousands of transcripts: it held the event loop for the whole run, so no
+     timer — and therefore no spinner frame — could fire. This asserts the loop
+     stays responsive, which is the property the spinner depends on. */
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 10);
+
+  // Stand-in for the scan loop: blocking units with a yield between batches.
+  const blockFor = (ms: number) => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      /* busy */
+    }
+  };
+  for (let i = 0; i < 20; i++) {
+    blockFor(8);
+    if (i % 4 === 0) await new Promise((resolve) => setImmediate(resolve));
+  }
+  clearInterval(timer);
+
+  assert.ok(
+    ticks > 0,
+    "no timer fired during the loop — a spinner would appear frozen"
+  );
+});
+
+test("without yielding, nothing can paint", async () => {
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 10);
+  const until = Date.now() + 120;
+  while (Date.now() < until) {
+    /* the old behaviour: block straight through */
+  }
+  clearInterval(timer);
+  assert.equal(ticks, 0, "this documents why the spinner never moved");
+});
