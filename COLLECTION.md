@@ -113,7 +113,7 @@ npm test
 # build the bundle and compare it to the one the installer downloads
 npm run build
 shasum -a 256 dist/cli.js
-curl -fsSL https://vibecom.build/cli.js | shasum -a 256
+curl -fsSL https://vibeland.vercel.app/cli.js | shasum -a 256
 ```
 
 The build is byte-reproducible: pass `VIBECOM_BUILD_STAMP` to match the stamp

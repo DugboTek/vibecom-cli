@@ -1,6 +1,6 @@
 # vibecom CLI
 
-The command-line collector for [vibecom](https://vibecom.build). It reads the
+The command-line collector for [vibecom](https://vibeland.vercel.app). It reads the
 session transcripts your coding tools already write to disk, adds up the
 counters in them, and sends those numbers — nothing else.
 
@@ -13,7 +13,7 @@ sends a field the document does not list, the build fails.
 ## Install
 
 ```bash
-curl -fsSL https://vibecom.build/setup.sh | bash
+curl -fsSL https://vibeland.vercel.app/setup.sh | bash
 ```
 
 The installer collects nothing. It does not modify your shell profile and it
@@ -64,7 +64,7 @@ embedded in your installed copy; pass it back in to rebuild that exact artifact:
 ```bash
 VIBECOM_BUILD_STAMP=$(vibecom --version) npm run build
 shasum -a 256 dist/cli.js
-curl -fsSL https://vibecom.build/cli.js | shasum -a 256
+curl -fsSL https://vibeland.vercel.app/cli.js | shasum -a 256
 ```
 
 Matching hashes mean the bundle you are running is built from this source.
