@@ -26,6 +26,14 @@ adds up the numbers, and sends counters. Nothing else.
 
 ---
 
+> [!NOTE]
+> This repository is published automatically from `cli/` in the vibecom
+> application repo. The CLI and the server share a wire protocol — a new field
+> changes the sender and the receiver in one commit — so they are developed
+> together and mirrored here on every merge. **Issues and pull requests are
+> welcome; a PR against this repo will be applied upstream rather than merged
+> here, since this branch is replaced on each publish.**
+
 ## Why this repo is public
 
 Telemetry tools ask for a lot of trust. This one reads your coding sessions, so
