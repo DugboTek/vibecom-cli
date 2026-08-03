@@ -19,6 +19,13 @@ import path from "node:path";
 
 export type Tool = "claude-code" | "codex" | "kimi";
 
+export type ActivityBucket = {
+  /** Start of the UTC hour this activity belongs to. */
+  bucketAtMs: number;
+  /** Conservative active time inside this hour. */
+  seconds: number;
+};
+
 export type SessionUsage = {
   tool: Tool;
   sessionId: string;
@@ -32,6 +39,11 @@ export type SessionUsage = {
   costUsd: number;
   /** human turns; 1 means a single prompt produced the whole session */
   turns: number;
+  /** First and last timestamp written inside the transcript itself. */
+  startedAtMs: number | null;
+  endedAtMs: number | null;
+  /** Active time distributed into real clock hours, with long idle gaps capped. */
+  activity: ActivityBucket[];
   /** kimi only: sha256(workdir)[:12], used when the index has no entry */
   workspaceHash?: string | null;
   /** project this session was attributed to; remembered across incremental reads */
@@ -45,6 +57,73 @@ export type SessionUsage = {
 const home = os.homedir();
 const num = (v: unknown): number =>
   typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+
+/* A chat can stay open overnight. Treating first-to-last as hands-on time would
+   turn that idle window into a heroic coding marathon, so any silence longer
+   than fifteen minutes contributes at most fifteen minutes. This is the same
+   inactivity-window idea used by editors and analytics tools, applied locally
+   before any derived counter leaves the machine. */
+export const ACTIVE_GAP_MS = 15 * 60 * 1000;
+
+function recordTimeMs(rec: Rec): number | null {
+  const raw = rec.timestamp ?? rec.time ?? rec.created_at;
+  const parsed =
+    typeof raw === "string"
+      ? Date.parse(raw)
+      : typeof raw === "number"
+        ? raw < 10_000_000_000
+          ? raw * 1000
+          : raw
+        : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Turn timestamped transcript events into conservative active-time buckets.
+ * Only gaps between real records count; a long idle gap is capped, and no
+ * invented tail is added after the final event.
+ */
+export function activityFromTimestamps(
+  values: readonly number[]
+): ActivityBucket[] {
+  const timestamps = [...new Set(values.filter((value) => Number.isFinite(value) && value > 0))]
+    .sort((a, b) => a - b);
+  const buckets = new Map<number, number>();
+
+  for (let index = 0; index < timestamps.length - 1; index++) {
+    let cursor = timestamps[index];
+    const next = timestamps[index + 1];
+    const activeEnd = cursor + Math.min(next - cursor, ACTIVE_GAP_MS);
+    while (cursor < activeEnd) {
+      const bucketAtMs = Math.floor(cursor / 3_600_000) * 3_600_000;
+      const segmentEnd = Math.min(activeEnd, bucketAtMs + 3_600_000);
+      buckets.set(
+        bucketAtMs,
+        (buckets.get(bucketAtMs) ?? 0) + (segmentEnd - cursor) / 1000
+      );
+      cursor = segmentEnd;
+    }
+  }
+
+  return [...buckets.entries()].map(([bucketAtMs, seconds]) => ({
+    bucketAtMs,
+    seconds,
+  }));
+}
+
+function finishTiming(u: SessionUsage, timestamps: number[]): SessionUsage {
+  /* mtime is a useful last-event fallback for older transcript formats that
+     only timestamp their opening record. The idle cap prevents a later file
+     touch from inflating focused time by hours or days. */
+  const timestamped = [...new Set(timestamps)];
+  const points = [...timestamped, ...(timestamped.length < 2 ? [u.mtimeMs] : [])]
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  u.startedAtMs = points[0] ?? null;
+  u.endedAtMs = points.at(-1) ?? null;
+  u.activity = activityFromTimestamps(points);
+  return u;
+}
 
 /**
  * Split without the phantom element a trailing newline produces.
@@ -107,13 +186,19 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
     cacheCreationTokens: 0,
     costUsd: 0,
     turns: 0,
+    startedAtMs: null,
+    endedAtMs: null,
+    activity: [],
     lines: countLines(file),
     mtimeMs: fs.statSync(file).mtimeMs,
     file,
   };
+  const timestamps: number[] = [];
 
   for (const raw of readLines(file, skip)) {
     const rec = raw as Rec;
+    const timestamp = recordTimeMs(rec);
+    if (timestamp !== null) timestamps.push(timestamp);
     if (typeof rec.sessionId === "string") u.sessionId ||= rec.sessionId;
     if (typeof rec.cwd === "string") u.cwd ||= rec.cwd;
     if (isHumanTurn(rec)) u.turns++;
@@ -131,7 +216,7 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
   }
 
   u.sessionId ||= path.basename(file, ".jsonl");
-  return u;
+  return finishTiming(u, timestamps);
 }
 
 /* ---------------------------------------------------------------- codex --- */
@@ -148,10 +233,14 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
     cacheCreationTokens: 0,
     costUsd: 0,
     turns: 0,
+    startedAtMs: null,
+    endedAtMs: null,
+    activity: [],
     lines: countLines(file),
     mtimeMs: fs.statSync(file).mtimeMs,
     file,
   };
+  const timestamps: number[] = [];
 
   // token_count carries a running total, so take the last one rather than
   // summing — adding every snapshot would multiply the real usage.
@@ -159,6 +248,8 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
 
   for (const raw of readLines(file, skip)) {
     const rec = raw as Rec;
+    const timestamp = recordTimeMs(rec);
+    if (timestamp !== null) timestamps.push(timestamp);
     const payload = (rec.payload ?? {}) as Rec;
 
     if (rec.type === "session_meta") {
@@ -188,7 +279,7 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
     u.cacheReadTokens = num(lastTotal.cached_input_tokens);
   }
   u.sessionId ||= path.basename(file, ".jsonl");
-  return u;
+  return finishTiming(u, timestamps);
 }
 
 /* ----------------------------------------------------------------- kimi --- */
@@ -205,13 +296,19 @@ function parseKimi(file: string, skip: number): SessionUsage | null {
     cacheCreationTokens: 0,
     costUsd: 0,
     turns: 0,
+    startedAtMs: null,
+    endedAtMs: null,
+    activity: [],
     lines: countLines(file),
     mtimeMs: fs.statSync(file).mtimeMs,
     file,
   };
+  const timestamps: number[] = [];
 
   for (const raw of readLines(file, skip)) {
     const rec = raw as Rec;
+    const timestamp = recordTimeMs(rec);
+    if (timestamp !== null) timestamps.push(timestamp);
     if (rec.type === "turn.prompt") u.turns++;
     if (typeof rec.model === "string") u.model ||= rec.model;
     if (rec.type === "usage.record") {
@@ -228,7 +325,7 @@ function parseKimi(file: string, skip: number): SessionUsage | null {
   const sessionDir = parts.find((p) => p.startsWith("session_"));
   u.sessionId ||= sessionDir?.replace("session_", "") ?? path.basename(file);
   u.workspaceHash = kimiWorkspaceHash(file);
-  return u;
+  return finishTiming(u, timestamps);
 }
 
 /**
