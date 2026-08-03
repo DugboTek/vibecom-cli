@@ -612,7 +612,7 @@ async function runScan(): Promise<{
         const res = await sendScanned(
           slot.origin,
           token,
-          batch.map((b) => b.delta)
+          batch.map((b) => ({ ...b.delta, endedAtMs: b.usage.mtimeMs }))
         );
         sent += res.accepted;
         sessions += batch.length;

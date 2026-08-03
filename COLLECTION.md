@@ -43,8 +43,14 @@ One record per coding session, to `POST /api/v1/logs`:
 | `cache_read_tokens` | number | Sum of cache-read tokens |
 | `cache_creation_tokens` | number | Sum of cache-write tokens |
 | `cost_usd` | number | Cost as reported by the tool itself |
+| `ended_at` | string | When the session last wrote to disk (ISO 8601), so activity is dated when it happened rather than when it was uploaded. Omitted if unknown |
 
 That is the entire payload. See `sendScanned()` in `src/core.ts`.
+
+`ended_at` is the transcript file's modification time — not a clock reading from
+inside your session, and not tied to any file path. Without it every imported
+session would be stamped with the moment you ran `vibecom scan`, which made a
+month of history look like a single hour of work.
 
 Two more values are attached **by the server**, from the token you authenticated
 with rather than from anything the CLI claims:

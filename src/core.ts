@@ -268,6 +268,8 @@ export async function sendScanned(
     cacheReadTokens: number;
     cacheCreationTokens: number;
     costUsd: number;
+    /** When the session last wrote to disk, ms since epoch. */
+    endedAtMs?: number;
   }[]
 ): Promise<{ accepted: number; dropped: number }> {
   const attr = (key: string, value: string | number) => ({
@@ -290,6 +292,12 @@ export async function sendScanned(
       attr("cache_read_tokens", s.cacheReadTokens),
       attr("cache_creation_tokens", s.cacheCreationTokens),
       attr("cost_usd", s.costUsd),
+      /* Without this the server stamps every row with the time of the import,
+         so a scan of months of history collapses onto a single hour and any
+         view of when work happened becomes a picture of when it was uploaded. */
+      ...(s.endedAtMs && Number.isFinite(s.endedAtMs)
+        ? [attr("ended_at", new Date(s.endedAtMs).toISOString())]
+        : []),
     ],
   }));
 
