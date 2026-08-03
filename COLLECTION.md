@@ -29,12 +29,13 @@ appears anywhere in the output.
 
 ## Exactly what is sent
 
-One summary record per coding session plus one active-time counter for each UTC
-hour the session occupied, to `POST /api/v1/logs`:
+One summary record per coding session, one active-time counter for each UTC
+hour the session occupied, and one record per linked repository, to
+`POST /api/v1/logs`:
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `event.name` | string | `vibecom.session` for the summary or `vibecom.session.activity` for an hourly active-time counter |
+| `event.name` | string | `vibecom.session` for the summary, `vibecom.session.activity` for an hourly active-time counter, or `vibecom.repo` for a repository's git counters |
 | `tool` | string | `claude-code`, `codex`, `opencode`, or `kimi` |
 | `session.id` | string | The tool's own session id, or the transcript filename |
 | `model` | string | Model name, e.g. `claude-opus-5`, `gpt-5.6-sol`. Omitted if the transcript does not record one |
@@ -43,14 +44,98 @@ hour the session occupied, to `POST /api/v1/logs`:
 | `output_tokens` | number | Sum of output tokens |
 | `cache_read_tokens` | number | Sum of cache-read tokens |
 | `cache_creation_tokens` | number | Sum of cache-write tokens |
-| `cost_usd` | number | Cost as reported by the tool itself |
+| `cost_usd` | number | Cost at published list prices, computed on your machine from the token counts above. Not a bill — see "How cost is calculated" |
+| `unpriced_tokens` | number | Tokens whose model has no published rate, so a partial `cost_usd` is never mistaken for a complete one |
 | `replace` | string | `true` when the record restates the session. The server replaces the prior copy, so a growing chat or re-import cannot double totals |
 | `started_at` | string | First timestamp recorded inside the transcript (ISO 8601). Omitted when the format does not expose one |
 | `ended_at` | string | Last timestamp recorded inside the transcript (ISO 8601), with file modification time used only for older formats that do not timestamp enough records |
 | `bucket_at` | string | Start of a UTC hour containing derived active time (ISO 8601). Present only on `vibecom.session.activity` records |
 | `active_seconds` | number | Active seconds in that hour. Derived from gaps between transcript events; gaps over 15 minutes contribute at most 15 minutes |
+| `commits` | number | Commits you authored in a linked repository since you linked it. Present only on `vibecom.repo` records — see "How git counters are collected" |
+| `lines_added` | number | Lines added across those commits, excluding lockfiles, vendored directories, build output, and binaries |
+| `lines_removed` | number | Lines removed across those commits, with the same exclusions |
+| `prs` | number | Distinct pull requests found in the subjects of those commits |
 
 That is the entire payload. See `sendScanned()` in `src/core.ts`.
+
+### How cost is calculated
+
+`cost_usd` is derived here, on your machine, and never read from a network
+service. Transcripts record token counts and a model name but no price, so the
+CLI multiplies those counts by the published list price for that model
+(`src/pricing.ts`) — full rate for input and output, a tenth for cache reads,
+and Anthropic's TTL-dependent premium for cache writes. Claude Code states a
+model on every assistant message, so each message is priced against the model
+that actually served it; Codex and Kimi report one total per session and are
+priced against that.
+
+It is an API-equivalent figure, not an invoice. A flat monthly subscription
+bills the same regardless, so this answers "what would this volume cost at list
+price" — the same question the old `claude_code.cost.usage` metric answered
+before the installer stopped enabling that export.
+
+Models with no published rate are never silently priced at zero. Their tokens
+are counted in `unpriced_tokens` instead, and the profile shows what share of
+your volume the figure actually covers.
+
+### How git counters are collected
+
+`commits`, `lines_added`, `lines_removed`, and `prs` are read from the git
+history of the repositories you have linked, by running `git log` locally
+(`src/gitStats.ts`).
+
+Claude Code also reports its own versions of these through the telemetry export
+this CLI configures, but they are no longer stored: the same commit arriving
+from two sources would be counted twice, and git is the better source on every
+axis — it is the actual record rather than a reported count, it covers every
+tool rather than one, and it can be read back over history no exporter was
+running for. Unlike token counts, there is nothing in a transcript to rebuild
+these from, so git is the only way to have them at all.
+
+This reads no prompt, no tool argument, and no file content — only commit
+metadata. Four integers per repository leave your machine. Commit messages,
+file paths, branch names, and author addresses are read to compute them and
+then dropped.
+
+- **Only your own commits count.** Attribution is by the addresses in
+  `user.email` (every scope, not just the winning one, since one person often
+  has several), plus any `Co-authored-by:` trailer naming you. A collaborator's
+  commits are read and discarded.
+- **Work you did through a coding agent counts as yours.** An agent commits
+  under its own name and leaves you as the committer; those are credited when
+  the committer is you, which is what keeps a colleague's agent work theirs.
+- **Only since you linked the project.** Connecting a repository with years of
+  history does not retroactively credit work you did before joining. The
+  boundary is the *author* date, compared here rather than passed to git's
+  `--since`, which compares the committer date and stops the walk at the first
+  older commit — one rebased commit can otherwise return an empty history.
+- **Generated churn is excluded.** Lockfiles, `node_modules/`, `vendor/`, build
+  output, minified bundles, snapshots, and binaries do not count as lines
+  written; a single `npm install` would otherwise outweigh a day of real work.
+  Anything your repository marks `linguist-generated` or `linguist-vendored` in
+  `.gitattributes` is excluded too.
+- **Churn is capped at 2,000 lines per file and 5,000 per commit.** A backstop
+  for generated content no pattern list anticipates. Measured across every
+  repository on one machine, the largest single commit was 1.3 million lines of
+  checked-in JSON snapshots — 41% of all churn everywhere combined — and matched
+  no exclusion rule, because that project stores them in a plain `snapshots/`
+  directory. The thresholds sit well outside hand-written work: the median
+  commit is 121 lines and the 99th percentile is 31,071.
+- **Merge commits are not counted** as commits, and their diffs are not counted
+  as lines, because everything they contain is already counted once.
+- **Pull requests are read from commit subjects** — the number a forge writes
+  when a pull request lands, deduplicated by number, across every branch and
+  tag rather than just the current one. No GitHub token is requested and no
+  network call is made. Checked against the GitHub API on seven repositories,
+  this matched exactly on six and reached 90% on the seventh.
+
+Known limits, stated rather than papered over. A pull request counts when the
+commit that landed it is attributed to you, so one you opened but a teammate
+merged is credited to them. A pull request merged by rebase leaves no marker in
+the history and cannot be detected locally at all. Only work reachable from the
+current branch is counted, so an unmerged branch contributes nothing until it
+lands — late rather than wrong, and it is what keeps a squash-merge from being
+counted twice.
 
 `started_at`, `ended_at`, and the hourly active counters come from timestamps
 already present on transcript records. They contain no transcript content and

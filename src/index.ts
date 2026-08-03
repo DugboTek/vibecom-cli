@@ -21,6 +21,7 @@ import {
   readProjectToken,
   recommendedRepos,
   readScanMarks,
+  sendRepoStats,
   sendScanned,
   uncoveredWorktrees,
   writeScanMarks,
@@ -54,6 +55,7 @@ import {
   transcriptSources,
   type SessionUsage,
 } from "./transcripts";
+import { collectRepoStats } from "./gitStats";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
    their own, so only bare console.log lines need one from us. */
 import {
@@ -556,10 +558,18 @@ async function runScan(
   skipped: number;
   byTool: Record<string, number>;
   failed: string[];
+  repos: number;
 }> {
   const slots = listSlots();
   if (slots.length === 0)
-    return { sent: 0, sessions: 0, skipped: 0, byTool: {}, failed: [] };
+    return {
+      sent: 0,
+      sessions: 0,
+      skipped: 0,
+      byTool: {},
+      failed: [],
+      repos: 0,
+    };
 
   const marks = readScanMarks();
   const kimiDirs = kimiWorkdirs();
@@ -700,6 +710,7 @@ async function runScan(
             cacheReadTokens: b.usage.cacheReadTokens,
             cacheCreationTokens: b.usage.cacheCreationTokens,
             costUsd: b.usage.costUsd,
+            unpricedTokens: b.usage.unpricedTokens,
             startedAtMs: b.usage.startedAtMs ?? undefined,
             endedAtMs: b.usage.endedAtMs ?? b.usage.mtimeMs,
             activity: b.usage.activity,
@@ -716,7 +727,51 @@ async function runScan(
   }
 
   writeScanMarks(marks);
-  return { sent, sessions, skipped, byTool, failed: [...failed] };
+
+  /* A second pass over every linked project, not just the ones with changed
+     sessions. Commits land without a transcript all the time — a rebase, a
+     merge, work done outside any AI tool — so gating this on transcript
+     activity would leave the counters permanently stale. */
+  const repos = await sendGitStats(slots, failed);
+
+  return { sent, sessions, skipped, byTool, failed: [...failed], repos };
+}
+
+/**
+ * Read git counters for each linked project and restate them.
+ *
+ * Totals are cumulative for the window rather than deltas, and every scan
+ * sends the whole figure again. That is what makes `rescan` a repair: the
+ * server replaces the previous copy instead of adding to it, so a corrected
+ * count converges rather than compounding.
+ */
+async function sendGitStats(
+  slots: ProjectSlot[],
+  failed: Set<string>
+): Promise<number> {
+  let sent = 0;
+  for (const slot of slots) {
+    const token = readProjectToken(slot.root);
+    if (!token) continue;
+
+    const linkedAt = new Date(slot.linkedAt);
+    const stats = collectRepoStats(
+      slot.root,
+      Number.isFinite(linkedAt.getTime()) ? linkedAt : null
+    );
+    /* Null means the directory is not a repository, git is unavailable, or
+       nothing has been committed yet. None of those are "zero work" — sending
+       zeros would overwrite a real count with a wrong one. */
+    if (!stats) continue;
+
+    try {
+      await sendRepoStats(slot.origin, token, [stats]);
+      sent += 1;
+    } catch (e) {
+      failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  return sent;
 }
 
 /** Record the session totals now known to be on the server. */
@@ -728,6 +783,7 @@ function markFor(u: SessionUsage, root: string, model?: string | null) {
     cacheReadTokens: u.cacheReadTokens,
     cacheCreationTokens: u.cacheCreationTokens,
     costUsd: u.costUsd,
+    unpricedTokens: u.unpricedTokens,
     file: u.file,
     lines: u.lines,
     mtimeMs: u.mtimeMs,
@@ -1114,6 +1170,15 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       );
     }
     for (const f of r.failed) p.log.warn(f);
+    if (r.repos > 0) {
+      console.log(
+        bullet(
+          pc.dim(
+            `${r.repos} repo(s) counted from git — commits, lines and PRs`
+          )
+        )
+      );
+    }
     if (r.skipped > 0) {
       console.log(
         bullet(pc.dim(`${r.skipped} session(s) in unlinked projects — ignored`))
@@ -1136,6 +1201,15 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       );
     }
     for (const f of r.failed) p.log.warn(f);
+    if (r.repos > 0) {
+      console.log(
+        bullet(
+          pc.dim(
+            `${r.repos} repo(s) counted from git — commits, lines and PRs`
+          )
+        )
+      );
+    }
     if (r.skipped > 0) {
       console.log(
         bullet(pc.dim(`${r.skipped} session(s) in unlinked projects — ignored`))

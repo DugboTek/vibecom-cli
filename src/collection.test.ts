@@ -23,15 +23,46 @@ function cliFile(...parts: string[]): string {
 const doc = fs.readFileSync(cliFile("COLLECTION.md"), "utf-8");
 const core = fs.readFileSync(cliFile("src", "core.ts"), "utf-8");
 
-/** Every `attr("name", ...)` emitted by sendScanned — the real wire payload. */
+/**
+ * Every sender whose payload the document describes.
+ *
+ * Listed explicitly rather than discovered, because the failure mode of a
+ * clever scan is silence: a sender it does not recognise contributes no
+ * attributes, both checks below pass over it, and the document stops
+ * describing what actually leaves the machine — the exact drift this file
+ * exists to prevent. A new sender must be added here, and the guard below
+ * fails until it is.
+ */
+const SENDERS = ["sendScanned", "sendRepoStats"];
+
+/** Every `attr("name", ...)` any sender emits — the real wire payload. */
 function wireAttributes(): string[] {
-  const start = core.indexOf("export async function sendScanned");
-  assert.ok(start > -1, "sendScanned not found — did the sender get renamed?");
-  const body = core.slice(start, core.indexOf("\n}", start));
-  const names = [...body.matchAll(/attr\(\s*"([^"]+)"/g)].map((m) => m[1]);
-  assert.ok(names.length > 0, "no attributes parsed out of sendScanned");
+  const names: string[] = [];
+  for (const sender of SENDERS) {
+    const start = core.indexOf(`export async function ${sender}`);
+    assert.ok(start > -1, `${sender} not found — did the sender get renamed?`);
+    const body = core.slice(start, core.indexOf("\n}", start));
+    const found = [...body.matchAll(/attr\(\s*"([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(found.length > 0, `no attributes parsed out of ${sender}`);
+    names.push(...found);
+  }
   return [...new Set(names)];
 }
+
+test("every sender that posts to the ingest API is covered by this guard", () => {
+  /* Without this, adding a third sender would silently narrow the two checks
+     below instead of failing them. */
+  const declared = [...core.matchAll(/export async function (send\w+)/g)].map(
+    (m) => m[1]
+  );
+  const unguarded = declared.filter((name) => !SENDERS.includes(name));
+  assert.deepEqual(
+    unguarded,
+    [],
+    `these senders are not covered by SENDERS in this test: ${unguarded.join(", ")}.\n` +
+      "Add them, or their attributes will go undocumented without failing anything."
+  );
+});
 
 test("every field the CLI sends is documented in COLLECTION.md", () => {
   const undocumented = wireAttributes().filter(

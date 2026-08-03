@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { priceUsage } from "./pricing";
 
 /**
  * Read what the coding tools already write to disk.
@@ -36,7 +37,13 @@ export type SessionUsage = {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  /** Derived from published list prices — see ./pricing. Never tool-reported. */
   costUsd: number;
+  /**
+   * Tokens from models with no published rate, so a $0 that means "we could not
+   * price this" stays distinguishable from a $0 that means "this was free".
+   */
+  unpricedTokens: number;
   /** human turns; 1 means a single prompt produced the whole session */
   turns: number;
   /** First and last timestamp written inside the transcript itself. */
@@ -126,6 +133,35 @@ function finishTiming(u: SessionUsage, timestamps: number[]): SessionUsage {
 }
 
 /**
+ * Price a session from its final totals.
+ *
+ * Claude Code states usage and model on every assistant message, so it is
+ * priced message by message. Codex and Kimi instead report one running total
+ * per session against a single model, leaving nothing finer to price against.
+ * Cache writes go in the five-minute bucket because neither vendor charges a
+ * TTL-dependent write premium; only Anthropic does, and Anthropic never
+ * reaches this path.
+ */
+function priceFromTotals(u: SessionUsage): void {
+  const usd = priceUsage(u.model, {
+    inputTokens: u.inputTokens,
+    outputTokens: u.outputTokens,
+    cacheReadTokens: u.cacheReadTokens,
+    cacheWrite5mTokens: u.cacheCreationTokens,
+    cacheWrite1hTokens: 0,
+  });
+  if (usd === null) {
+    u.unpricedTokens =
+      u.inputTokens +
+      u.outputTokens +
+      u.cacheReadTokens +
+      u.cacheCreationTokens;
+  } else {
+    u.costUsd = usd;
+  }
+}
+
+/**
  * Split without the phantom element a trailing newline produces.
  *
  * Counting it would advance the watermark one line past the real end, so the
@@ -185,6 +221,7 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     costUsd: 0,
+    unpricedTokens: 0,
     turns: 0,
     startedAtMs: null,
     endedAtMs: null,
@@ -206,13 +243,47 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
     const message = rec.message as Rec | undefined;
     if (typeof message?.model === "string") u.model ||= message.model;
     const usage = message?.usage as Rec | undefined;
-    if (usage) {
-      u.inputTokens += num(usage.input_tokens);
-      u.outputTokens += num(usage.output_tokens);
-      u.cacheReadTokens += num(usage.cache_read_input_tokens);
-      u.cacheCreationTokens += num(usage.cache_creation_input_tokens);
+    if (!usage) continue;
+
+    const inputTokens = num(usage.input_tokens);
+    const outputTokens = num(usage.output_tokens);
+    const cacheReadTokens = num(usage.cache_read_input_tokens);
+    const cacheCreationTokens = num(usage.cache_creation_input_tokens);
+    u.inputTokens += inputTokens;
+    u.outputTokens += outputTokens;
+    u.cacheReadTokens += cacheReadTokens;
+    u.cacheCreationTokens += cacheCreationTokens;
+
+    /* Cache writes are billed by TTL, and the hour tier costs 1.6x the
+       five-minute one. `cache_creation` states the hour figure; taking the
+       rest as five-minute conserves the documented total even on older
+       records that omit the breakdown entirely. */
+    const split = usage.cache_creation as Rec | undefined;
+    const cacheWrite1hTokens = num(split?.ephemeral_1h_input_tokens);
+    const cacheWrite5mTokens = Math.max(
+      0,
+      cacheCreationTokens - cacheWrite1hTokens
+    );
+
+    /* Priced per message rather than per session: a session that switches
+       models mid-way would otherwise bill all of its tokens at whichever
+       model happened to speak first. */
+    const usd = priceUsage(
+      typeof message?.model === "string" ? message.model : null,
+      {
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheWrite5mTokens,
+        cacheWrite1hTokens,
+      }
+    );
+    if (usd === null) {
+      u.unpricedTokens +=
+        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+    } else {
+      u.costUsd += usd;
     }
-    u.costUsd += num(rec.costUSD) || num(rec.cost_usd);
   }
 
   u.sessionId ||= path.basename(file, ".jsonl");
@@ -232,6 +303,7 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     costUsd: 0,
+    unpricedTokens: 0,
     turns: 0,
     startedAtMs: null,
     endedAtMs: null,
@@ -274,11 +346,20 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
   }
 
   if (lastTotal) {
-    u.inputTokens = num(lastTotal.input_tokens);
+    /* `input_tokens` is the whole input, with `cached_input_tokens` a subset of
+       it — the transcript's own `total_tokens` equals input plus output, so
+       cached is already inside that figure. Reading the two as siblings counted
+       every cached token twice, which on one real machine turned 8.5M fresh
+       input tokens into 1.09B reported. Subtracting leaves what was actually
+       charged at the full rate. */
+    const wholeInput = num(lastTotal.input_tokens);
+    u.cacheReadTokens = Math.min(num(lastTotal.cached_input_tokens), wholeInput);
+    u.inputTokens = wholeInput - u.cacheReadTokens;
     u.outputTokens = num(lastTotal.output_tokens);
-    u.cacheReadTokens = num(lastTotal.cached_input_tokens);
+    u.cacheCreationTokens = num(lastTotal.cache_write_input_tokens);
   }
   u.sessionId ||= path.basename(file, ".jsonl");
+  priceFromTotals(u);
   return finishTiming(u, timestamps);
 }
 
@@ -295,6 +376,7 @@ function parseKimi(file: string, skip: number): SessionUsage | null {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     costUsd: 0,
+    unpricedTokens: 0,
     turns: 0,
     startedAtMs: null,
     endedAtMs: null,
@@ -325,6 +407,7 @@ function parseKimi(file: string, skip: number): SessionUsage | null {
   const sessionDir = parts.find((p) => p.startsWith("session_"));
   u.sessionId ||= sessionDir?.replace("session_", "") ?? path.basename(file);
   u.workspaceHash = kimiWorkspaceHash(file);
+  priceFromTotals(u);
   return finishTiming(u, timestamps);
 }
 

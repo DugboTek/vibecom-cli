@@ -237,6 +237,7 @@ export type ScanMark = {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   costUsd: number;
+  unpricedTokens?: number;
   /** the most complete transcript seen for this session */
   file: string;
   lines: number;
@@ -270,6 +271,8 @@ export async function sendScanned(
     cacheReadTokens: number;
     cacheCreationTokens: number;
     costUsd: number;
+    /** Tokens whose model has no published rate, so coverage stays visible. */
+    unpricedTokens: number;
     /** First and last event times read from inside the transcript. */
     startedAtMs?: number;
     endedAtMs?: number;
@@ -297,6 +300,7 @@ export async function sendScanned(
       attr("cache_read_tokens", s.cacheReadTokens),
       attr("cache_creation_tokens", s.cacheCreationTokens),
       attr("cost_usd", s.costUsd),
+      attr("unpriced_tokens", s.unpricedTokens),
       ...(s.startedAtMs && Number.isFinite(s.startedAtMs)
         ? [attr("started_at", new Date(s.startedAtMs).toISOString())]
         : []),
@@ -324,6 +328,55 @@ export async function sendScanned(
     }))
   );
   const logRecords = [...sessionRecords, ...activityRecords];
+
+  return request<{ accepted: number; dropped: number }>(
+    origin,
+    "/api/v1/logs",
+    json({ resourceLogs: [{ scopeLogs: [{ logRecords }] }] }, token)
+  );
+}
+
+/**
+ * Send the counters read out of a linked repository's git history.
+ *
+ * A separate record from `vibecom.session`, deliberately. A scanned session is
+ * a snapshot keyed on its session id, and the server replaces the metric types
+ * that snapshot carries — so attaching repository counters to it would let a
+ * rescan delete numbers the transcript cannot regenerate. That already happened
+ * once; there is a regression test on the server pinning it shut.
+ *
+ * These totals are cumulative for the window, not deltas, so every scan
+ * restates them and the server replaces the previous copy. Recounting from
+ * scratch is what makes a rescan a repair rather than a doubling.
+ */
+export async function sendRepoStats(
+  origin: string,
+  token: string,
+  repos: {
+    commits: number;
+    linesAdded: number;
+    linesRemoved: number;
+    prs: number;
+  }[]
+): Promise<{ accepted: number; dropped: number }> {
+  const attr = (key: string, value: string | number) => ({
+    key,
+    value:
+      typeof value === "number"
+        ? { doubleValue: value }
+        : { stringValue: value },
+  });
+
+  const logRecords = repos.map((repo) => ({
+    attributes: [
+      attr("event.name", "vibecom.repo"),
+      attr("commits", repo.commits),
+      attr("lines_added", repo.linesAdded),
+      attr("lines_removed", repo.linesRemoved),
+      attr("prs", repo.prs),
+      attr("replace", "true"),
+    ],
+  }));
 
   return request<{ accepted: number; dropped: number }>(
     origin,
@@ -396,12 +449,30 @@ function realpath(p: string): string {
   }
 }
 
-function git(args: string[], cwd: string): string | null {
+/**
+ * Run git and return stdout, or null if anything at all went wrong.
+ *
+ * The caps are load-bearing rather than defensive. Every original caller asked
+ * git for a path or a short list, so the defaults were never tested against a
+ * large answer — but `git log --numstat` over a real history runs to megabytes,
+ * and Node's default `maxBuffer` is 1 MiB. Exceeding it throws, the bare catch
+ * turns that into null, and the caller reads null as "no commits". The failure
+ * would be silent, and worst on exactly the busy repositories most worth
+ * measuring. The timeout covers the other end of the same problem: a repo whose
+ * history is slow to walk should degrade to a missing number, not a hung scan.
+ */
+function git(
+  args: string[],
+  cwd: string,
+  limits: { maxBuffer?: number; timeout?: number } = {}
+): string | null {
   try {
     return execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: limits.maxBuffer ?? 1024 * 1024,
+      timeout: limits.timeout ?? 10_000,
     }).trim();
   } catch {
     return null;

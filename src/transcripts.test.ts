@@ -126,6 +126,134 @@ test("no transcript content survives parsing, from any tool", () => {
   }
 });
 
+test("claude code: cost is derived per message from the model that served it", () => {
+  /* Transcripts carry no cost field — only usage and a model — so the figure
+     is computed from list prices. Pricing per message rather than per session
+     is what keeps a session that switched models from billing all of its
+     tokens at whichever model happened to speak first. */
+  const file = jsonl("cc-cost.jsonl", [
+    { type: "user", sessionId: "s-cost", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-opus-5", // $5/M in, $25/M out
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      },
+    },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-haiku-4-5", // $1/M in, $5/M out
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      },
+    },
+  ]);
+  const u = parserFor("claude-code")(file, 0)!;
+  assert.equal(u.costUsd, 36, "30 at Opus rates plus 6 at Haiku rates");
+  assert.equal(u.unpricedTokens, 0);
+});
+
+test("claude code: cache writes are billed by their TTL", () => {
+  const file = jsonl("cc-ttl.jsonl", [
+    { type: "user", sessionId: "s-ttl", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-opus-5",
+        usage: {
+          cache_creation_input_tokens: 1_000_000,
+          cache_creation: {
+            ephemeral_1h_input_tokens: 1_000_000,
+            ephemeral_5m_input_tokens: 0,
+          },
+        },
+      },
+    },
+  ]);
+  const u = parserFor("claude-code")(file, 0)!;
+  // The hour tier is 2x input, against 1.25x for five minutes.
+  assert.equal(u.costUsd, 10);
+  assert.equal(u.cacheCreationTokens, 1_000_000, "the wire total is unchanged");
+});
+
+test("claude code: a record without the TTL breakdown still prices its writes", () => {
+  // Older records state only the total. Taking the remainder as five-minute
+  // conserves it rather than silently dropping the tokens from the bill.
+  const file = jsonl("cc-nottl.jsonl", [
+    { type: "user", sessionId: "s-nottl", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-opus-5",
+        usage: { cache_creation_input_tokens: 1_000_000 },
+      },
+    },
+  ]);
+  assert.equal(parserFor("claude-code")(file, 0)!.costUsd, 6.25);
+});
+
+test("claude code: an unrated model is counted, not quietly priced at zero", () => {
+  const file = jsonl("cc-unrated.jsonl", [
+    { type: "user", sessionId: "s-un", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-something-unreleased",
+        usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 5 },
+      },
+    },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-opus-5",
+        usage: { output_tokens: 1_000_000 },
+      },
+    },
+  ]);
+  const u = parserFor("claude-code")(file, 0)!;
+  assert.equal(u.costUsd, 25, "the rated message still bills normally");
+  assert.equal(u.unpricedTokens, 35, "and the unrated one is reported as a gap");
+});
+
+test("claude code: synthetic messages are free without denting coverage", () => {
+  const file = jsonl("cc-synth.jsonl", [
+    { type: "user", sessionId: "s-syn", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: { model: "<synthetic>", usage: { input_tokens: 7, output_tokens: 3 } },
+    },
+  ]);
+  const u = parserFor("claude-code")(file, 0)!;
+  assert.equal(u.costUsd, 0);
+  assert.equal(u.unpricedTokens, 0, "never billable, so not a pricing gap");
+});
+
+test("claude code: re-parsing a transcript yields the same cost", () => {
+  /* `vibecom rescan` restates each session in full and the server replaces the
+     prior copy. That only converges if parsing is deterministic — a cost that
+     drifted between scans would silently rewrite history on every run. */
+  const file = jsonl("cc-idem.jsonl", [
+    { type: "user", sessionId: "s-idem", cwd: "/code/app", message: { content: SECRET } },
+    {
+      type: "assistant",
+      message: {
+        model: "claude-sonnet-5",
+        usage: {
+          input_tokens: 1_234,
+          output_tokens: 567,
+          cache_read_input_tokens: 89,
+          cache_creation_input_tokens: 42,
+        },
+      },
+    },
+  ]);
+  const first = parserFor("claude-code")(file, 0)!;
+  const second = parserFor("claude-code")(file, 0)!;
+  assert.ok(first.costUsd > 0, "the fixture actually prices to something");
+  assert.equal(first.costUsd, second.costUsd);
+  assert.equal(first.unpricedTokens, second.unpricedTokens);
+});
+
 /* ------- codex ------- */
 
 test("codex: user_message counts as a turn, totals are not summed twice", () => {
@@ -153,6 +281,92 @@ test("codex: user_message counts as a turn, totals are not summed twice", () => 
   assert.equal(u.inputTokens, 250, "must take the last total, not the sum");
   assert.equal(u.outputTokens, 90);
   assert.equal(u.cwd, "/code/app");
+});
+
+test("codex: cached input is subtracted from the input total, not added to it", () => {
+  /* `input_tokens` is the whole input and `cached_input_tokens` is a subset of
+     it — the transcript's own `total_tokens` equals input plus output.
+     Treating them as siblings counted every cached token twice; on one real
+     machine that turned 8.5M fresh input tokens into 1.09B reported. */
+  const file = jsonl("cx-cached.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx-c", cwd: "/code/app" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 1_000,
+            cached_input_tokens: 900,
+            cache_write_input_tokens: 20,
+            output_tokens: 100,
+            total_tokens: 1_100,
+          },
+        },
+      },
+    },
+  ]);
+  const u = parserFor("codex")(file, 0)!;
+  assert.equal(u.inputTokens, 100, "fresh input only");
+  assert.equal(u.cacheReadTokens, 900);
+  assert.equal(u.cacheCreationTokens, 20);
+  assert.equal(
+    u.inputTokens + u.cacheReadTokens + u.outputTokens,
+    1_100,
+    "reconstructs the transcript's own total_tokens"
+  );
+});
+
+test("codex: cost is derived from the session totals", () => {
+  const file = jsonl("cx-cost.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx-p", cwd: "/code/app" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            output_tokens: 1_000_000,
+          },
+        },
+      },
+    },
+  ]);
+  const u = parserFor("codex")(file, 0)!;
+  // gpt-5.6-sol is $5/M in, $30/M out.
+  assert.equal(u.costUsd, 35);
+  assert.equal(u.unpricedTokens, 0);
+});
+
+test("codex: an unrated model reports tokens as unpriced, never as $0", () => {
+  const file = jsonl("cx-unrated.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx-u", cwd: "/code/app" } },
+    { type: "turn_context", payload: { model: "gpt-5.4" } },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 500,
+            cached_input_tokens: 100,
+            output_tokens: 200,
+          },
+        },
+      },
+    },
+  ]);
+  const u = parserFor("codex")(file, 0)!;
+  assert.equal(u.costUsd, 0);
+  assert.equal(
+    u.unpricedTokens,
+    700,
+    "400 fresh input + 100 cache read + 200 output"
+  );
 });
 
 test("codex: the model comes from turn_context, not session_meta", () => {
@@ -258,6 +472,7 @@ const usage = (o: Partial<SessionUsage>): SessionUsage => ({
   cacheReadTokens: 0,
   cacheCreationTokens: 0,
   costUsd: 0,
+  unpricedTokens: 0,
   turns: 0,
   startedAtMs: null,
   endedAtMs: null,
