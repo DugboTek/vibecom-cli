@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "test": "node --import tsx --test src/*.test.ts",
     "verify": "npm test && npm run build && shasum -a 256 dist/cli.js"
   },
   "devDependencies": {
