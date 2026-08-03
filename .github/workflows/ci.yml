@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm test
+
+  # The point of this repo is that you can check the bundle you run. If the
+  # build stopped being reproducible, that claim would quietly become false —
+  # so prove it on every commit rather than trusting the README.
+  reproducible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - name: build twice with a pinned stamp
+        run: |
+          VIBECOM_BUILD_STAMP=1970-01-01T00:00:00Z npm run build
+          A=$(shasum -a 256 dist/cli.js | cut -d' ' -f1)
+          rm -rf dist
+          VIBECOM_BUILD_STAMP=1970-01-01T00:00:00Z npm run build
+          B=$(shasum -a 256 dist/cli.js | cut -d' ' -f1)
+          echo "build 1: $A"
+          echo "build 2: $B"
+          test "$A" = "$B" || { echo "::error::build is not reproducible"; exit 1; }

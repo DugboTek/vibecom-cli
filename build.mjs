@@ -4,7 +4,7 @@ import path from "node:path";
 
 /* Standalone build, byte-identical to the bundle vibecom.build serves.
    Pin the stamp to reproduce a published artifact exactly:
-     VIBECOM_BUILD_STAMP=$(vibecom --version) npm run build
+     VIBECOM_BUILD_STAMP=$(vibecom --version | grep -oE '[0-9-]{10}T[0-9:]{8}Z') npm run build
      shasum -a 256 dist/cli.js */
 const outfile = path.join(process.cwd(), "dist", "cli.js");
 mkdirSync(path.dirname(outfile), { recursive: true });
