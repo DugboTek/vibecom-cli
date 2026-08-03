@@ -132,7 +132,9 @@ export function resolveOrigin(): string {
   try {
     savedOrigin = fs.readFileSync(ORIGIN_FILE, "utf8").trim();
   } catch {
-    return "https://vibecom.build";
+    // Must be the host that serves directly — a redirecting origin
+    // would strip the Authorization header off every request.
+    return "https://www.vibecom.build";
   }
   return secureOrigin(savedOrigin);
 }
@@ -731,9 +733,33 @@ async function request<T>(
   origin = secureOrigin(origin);
   let res: Response;
   try {
-    res = await fetch(origin + route, init);
+    /* Manual redirects, deliberately. A host that redirects to a different
+       origin — apex to www being the usual one — makes fetch strip the
+       Authorization header on the way, so every authenticated call comes back
+       as "missing Bearer token" and looks like a bad credential rather than a
+       misconfigured host. Following it silently would send requests somewhere
+       the token was never issued for, so name the canonical host instead. */
+    res = await fetch(origin + route, { ...init, redirect: "manual" });
   } catch {
     throw new ApiError(`could not reach ${origin}`);
+  }
+
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get("location");
+    let target = "";
+    try {
+      target = location ? new URL(location, origin).origin : "";
+    } catch {
+      target = "";
+    }
+    if (target && target !== origin) {
+      throw new ApiError(
+        `${origin} redirects to ${target}. Credentials are not carried across ` +
+          `a redirect, so point the CLI at the canonical host: ` +
+          `VIBECOM_ORIGIN=${target} vibecom login`
+      );
+    }
+    throw new ApiError(`${origin} returned an unexpected redirect`);
   }
 
   if ((res.status === 429 || res.status >= 500) && attempt < 4) {

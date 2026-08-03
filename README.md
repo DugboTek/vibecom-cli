@@ -9,7 +9,7 @@
   ╚═══╝  ╚═╝╚═════╝ ╚══════╝ ╚═════╝ ╚═════╝ ╚═╝     ╚═╝
 </pre>
 
-**The command-line collector for [vibecom](https://vibeland.vercel.app) — the community for AI builders.**
+**The command-line collector for [vibecom](https://vibecom.build) — the community for AI builders.**
 
 It reads the session transcripts your coding tools already write to disk,
 adds up the numbers, and sends counters. Nothing else.
@@ -47,7 +47,7 @@ code never sends.
 ## Install
 
 ```bash
-curl -fsSL https://vibeland.vercel.app/setup.sh | bash
+curl -fsSL https://vibecom.build/setup.sh | bash
 ```
 
 <details>
@@ -68,7 +68,7 @@ install -m 755 dist/cli.js ~/.local/bin/vibecom
 Or read the installer first — it is a plain shell script:
 
 ```bash
-curl -fsSL https://vibeland.vercel.app/setup.sh | less
+curl -fsSL https://vibecom.build/setup.sh | less
 ```
 
 </details>
@@ -135,7 +135,7 @@ into your installed copy — pass it back in and you get that exact artifact:
 ```bash
 VIBECOM_BUILD_STAMP=$(vibecom --version | grep -oE '[0-9-]{10}T[0-9:]{8}Z') npm run build
 shasum -a 256 dist/cli.js
-curl -fsSL https://vibeland.vercel.app/cli.js | shasum -a 256
+curl -fsSL https://vibecom.build/cli.js | shasum -a 256
 ```
 
 Matching hashes mean the binary you are running was built from this source, with

@@ -20,6 +20,7 @@ import {
   settingsPathFor,
   secureOrigin,
   writeProjectSettings,
+  sendScanned,
 } from "./core";
 
 // realpath: macOS symlinks /var -> /private/var, and git reports real paths.
@@ -352,4 +353,46 @@ test("info/exclude symlinks are not followed", () => {
 
   ensureExcluded(dir);
   assert.equal(fs.readFileSync(outside, "utf8"), "keep");
+});
+
+test("a cross-origin redirect is reported, not silently followed", async () => {
+  /* apex -> www is a different origin, so fetch strips Authorization on the
+     way through. Following it would turn every authenticated call into
+     "missing Bearer token", which reads as a bad credential rather than a
+     misconfigured host. */
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(null, {
+      status: 308,
+      headers: { location: "https://www.example.com/api/v1/logs" },
+    })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => sendScanned("https://example.com", "tok", []),
+      (error: Error) => {
+        assert.match(error.message, /redirects to https:\/\/www\.example\.com/);
+        assert.match(error.message, /VIBECOM_ORIGIN=https:\/\/www\.example\.com/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("a same-origin redirect is still refused rather than looped", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(null, {
+      status: 302,
+      headers: { location: "/somewhere-else" },
+    })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => sendScanned("https://example.com", "tok", []),
+      /unexpected redirect/
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
 });

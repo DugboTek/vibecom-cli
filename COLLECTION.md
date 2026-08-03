@@ -100,6 +100,11 @@ listed here first.
 Run `vibecom preview` to print the live policy from the server you are pointed
 at, and `vibecom tier` to see what a project is currently linked at.
 
+> The CLI talks to the host that issued your credentials, not wherever it was
+> downloaded from — a token is only valid where it was minted. If you point it
+> at a host that redirects elsewhere it will say so rather than silently fail,
+> because credentials are not carried across a redirect.
+
 ## Verifying this yourself
 
 ```bash
@@ -113,7 +118,7 @@ npm test
 # build the bundle and compare it to the one the installer downloads
 npm run build
 shasum -a 256 dist/cli.js
-curl -fsSL https://vibeland.vercel.app/cli.js | shasum -a 256
+curl -fsSL https://vibecom.build/cli.js | shasum -a 256
 ```
 
 The build is byte-reproducible: pass `VIBECOM_BUILD_STAMP` to match the stamp
