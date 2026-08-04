@@ -45,15 +45,100 @@ test("cache reads bill at a tenth of input, writes at a premium", () => {
   assert.equal(write1h, 10);
 });
 
-test("OpenAI cache writes are free, unlike Anthropic's", () => {
+test("GPT-5.6 bills cache writes and discounts cache reads", () => {
   assert.equal(
-    priceUsage("gpt-5.6-sol", usage({ cacheWrite5mTokens: 1_000_000 })),
-    0
+    priceUsage("gpt-5.6-sol", usage({ cacheWrite5mTokens: 100_000 })),
+    0.625
   );
   assert.equal(
-    priceUsage("gpt-5.6-sol", usage({ cacheReadTokens: 1_000_000 })),
-    0.5
+    priceUsage("gpt-5.6-sol", usage({ cacheReadTokens: 100_000 })),
+    0.05
   );
+  assert.equal(
+    priceUsage("gpt-5.5", usage({ cacheWrite5mTokens: 100_000 })),
+    0,
+    "the write charge starts with GPT-5.6"
+  );
+});
+
+test("every GPT-5.6 tier uses its published list rate", () => {
+  assert.equal(
+    priceUsage("gpt-5.6-terra", usage({ inputTokens: 100_000 })),
+    0.2
+  );
+  assert.equal(
+    priceUsage("gpt-5.6-terra", usage({ outputTokens: 100_000 })),
+    1.2
+  );
+  assert.equal(
+    priceUsage("gpt-5.6-luna", usage({ inputTokens: 100_000 })),
+    0.02
+  );
+  assert.equal(
+    priceUsage("gpt-5.6-luna", usage({ outputTokens: 100_000 })),
+    0.12
+  );
+});
+
+test("published rates cover the Codex models present in historical scans", () => {
+  assert.equal(
+    priceUsage("gpt-5.2-codex", usage({ outputTokens: 100_000 })),
+    1.4
+  );
+  assert.equal(
+    priceUsage("gpt-5.3-codex", usage({ inputTokens: 100_000 })),
+    0.175
+  );
+  assert.equal(
+    priceUsage("gpt-5.4", usage({ outputTokens: 100_000 })),
+    1.5
+  );
+  assert.equal(
+    priceUsage("gpt-5.4-mini", usage({ inputTokens: 100_000 })),
+    0.075
+  );
+});
+
+test("OpenAI long-context pricing is applied per request", () => {
+  const atLimit = priceUsage(
+    "gpt-5.6-sol",
+    usage({ inputTokens: 2_000, cacheReadTokens: 270_000, outputTokens: 10_000 })
+  );
+  const aboveLimit = priceUsage(
+    "gpt-5.6-sol",
+    usage({ inputTokens: 2_001, cacheReadTokens: 270_000, outputTokens: 10_000 })
+  );
+
+  assert.equal(atLimit, 0.445);
+  assert.equal(aboveLimit, 0.74001);
+});
+
+test("GPT-5.4 mini does not receive the 1.05M-context uplift", () => {
+  assert.equal(
+    priceUsage("gpt-5.4-mini", usage({ inputTokens: 1_000_000 })),
+    0.75
+  );
+});
+
+test("Sonnet 5 uses its current introductory rate", () => {
+  assert.equal(
+    priceUsage(
+      "claude-sonnet-5",
+      usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 })
+    ),
+    12
+  );
+});
+
+test("Kimi K3 and its wire model id use the published API rate", () => {
+  for (const model of ["k3", "kimi-code/k3"]) {
+    assert.equal(priceUsage(model, usage({ inputTokens: 100_000 })), 0.3);
+    assert.ok(
+      Math.abs(priceUsage(model, usage({ cacheReadTokens: 100_000 }))! - 0.03) <
+        1e-12
+    );
+    assert.equal(priceUsage(model, usage({ outputTokens: 100_000 })), 1.5);
+  }
 });
 
 test("a dated snapshot resolves to its model family", () => {
@@ -66,10 +151,10 @@ test("a dated snapshot resolves to its model family", () => {
 
 test("the longest matching family wins", () => {
   // A shorter prefix must never price a more specific model.
-  const specific = priceUsage("gpt-5.6-terra", usage({ inputTokens: 1_000_000 }));
-  const other = priceUsage("gpt-5.6-sol", usage({ inputTokens: 1_000_000 }));
-  assert.equal(specific, 2);
-  assert.equal(other, 5);
+  const specific = priceUsage("gpt-5.6-terra", usage({ inputTokens: 100_000 }));
+  const other = priceUsage("gpt-5.6-sol", usage({ inputTokens: 100_000 }));
+  assert.equal(specific, 0.2);
+  assert.equal(other, 0.5);
 });
 
 test("a family key does not match a longer sibling number", () => {
@@ -82,8 +167,10 @@ test("an unrated model returns null rather than zero", () => {
   // This is the whole contract: the caller must be able to tell "nothing to
   // charge" apart from "we had no rate", because a silent zero is what made
   // cost vanish from every profile in the first place.
-  assert.equal(priceUsage("k3", usage({ outputTokens: 5_000_000 })), null);
-  assert.equal(priceUsage("gpt-5.4", usage({ outputTokens: 5_000_000 })), null);
+  assert.equal(
+    priceUsage("gpt-5.3-codex-spark", usage({ outputTokens: 5_000_000 })),
+    null
+  );
   assert.equal(priceUsage(null, usage({ outputTokens: 5_000_000 })), null);
   assert.equal(priceUsage(undefined, usage({ outputTokens: 1 })), null);
 });

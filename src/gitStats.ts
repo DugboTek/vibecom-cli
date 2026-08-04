@@ -132,11 +132,17 @@ export const PER_FILE_LINE_CAP = 2000;
  * file would still let it contribute 172,000.
  *
  * No path list can enumerate every convention; a commit-level ceiling is the
- * only rule that holds against the one nobody thought of. Set from the measured
- * distribution — median commit 121 lines, p90 1,885, p99 31,071 — so it sits
- * above nine commits in ten and bites only the outliers.
+ * only rule that holds against the one nobody thought of.
+ *
+ * Set high deliberately. An earlier 5,000 was shaping the numbers rather than
+ * guarding them — on this repository it clipped a real 5,948-line commit and,
+ * before the store below was declared generated, it was discarding 48% of
+ * additions and 77% of removals. Exclusions are what should do the work; this
+ * only has to stop an undeclared dump from dwarfing everything, so it sits
+ * above anything a person plausibly writes in one commit (the largest here is
+ * 5,948) and well below a generated one.
  */
-export const PER_COMMIT_LINE_CAP = 5000;
+export const PER_COMMIT_LINE_CAP = 25_000;
 
 /**
  * Pull-request references in a commit subject.
@@ -160,7 +166,9 @@ const PR_PATTERNS = [
   // Bitbucket: "Merged in feature/x (pull request #12)"
   /\bpull request #(\d+)\)/,
   // GitHub squash or rebase merge: subject ends "... (#12)"
-  /\(#(\d+)\)\s*$/,
+  /\(#(\d+)\)/,
+  // Custom squash subjects such as "release feature (PR #80)".
+  /\bPR #(\d+)\b/i,
   // GitLab: "See merge request group/project!12"
   /\bSee merge request [^\s!]*!(\d+)\b/,
 ];
@@ -198,9 +206,33 @@ export function gitIdentities(cwd: string): Set<string> {
   const raw = runGit(["config", "--get-all", "user.email"], cwd) ?? "";
   for (const line of raw.split("\n")) {
     const email = line.trim().toLowerCase();
-    if (email) emails.add(email);
+    if (!email) continue;
+    emails.add(email);
+    /* `git log --use-mailmap` canonicalizes historical aliases. Canonicalize
+       the configured identities too, while retaining the raw form, so a
+       repository's own mailmap cannot accidentally hide its owner's commits. */
+    const canonical = runGit(["check-mailmap", `<${email}>`], cwd) ?? "";
+    for (const mapped of canonical.matchAll(/<([^>]+)>/g)) {
+      if (mapped[1]) emails.add(mapped[1].trim().toLowerCase());
+    }
   }
   return emails;
+}
+
+function shippedRef(root: string): string {
+  /* A working tree may be checked out on a months-old feature branch. Prefer
+     the fetched default branch as the stable definition of shipped work, with
+     HEAD as the honest fallback for local-only repositories. */
+  const remoteDefault = (
+    runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], root) ?? ""
+  ).trim();
+  if (
+    remoteDefault &&
+    runGit(["rev-parse", "--verify", "--quiet", remoteDefault], root)
+  ) {
+    return remoteDefault;
+  }
+  return "HEAD";
 }
 
 function runGit(args: string[], cwd: string): string | null {
@@ -259,9 +291,17 @@ export function declaredGeneratedPaths(
   }
   for (const line of raw.split("\n")) {
     /* "<path>: <attribute>: <value>" — but a path may itself contain ": ", so
-       the two known suffixes are stripped from the end rather than split on. */
+       the two known suffixes are stripped from the end rather than split on.
+
+       Both spellings count. A bare `linguist-generated` reports as "set", while
+       the `linguist-generated=true` form — the one GitHub's own documentation
+       uses, and therefore the one most repositories write — reports as "true".
+       Accepting only "set" made the whole mechanism a silent no-op on exactly
+       the repositories that had bothered to declare anything. */
     const match = line.match(/^(.*): (?:linguist-generated|linguist-vendored): (.*)$/);
-    if (match && match[2] === "set") generated.add(match[1]);
+    if (match && (match[2] === "set" || match[2] === "true")) {
+      generated.add(match[1]);
+    }
   }
   return generated;
 }
@@ -427,7 +467,8 @@ export function parseGitLog(
  * credit a decade of work, and so these counters cover the same window as the
  * token counters they sit beside.
  *
- * Walks `HEAD` rather than every ref. The broader `--branches --remotes --tags`
+ * Walks the fetched remote-default branch (or `HEAD` for a local-only repo)
+ * rather than every ref. The broader `--branches --remotes --tags`
  * sees more, but it also sees both halves of a squash-merge — the original
  * branch commits and the single squashed copy on the trunk — and counts the
  * work twice. From HEAD a squashed pull request is reachable exactly once. The
@@ -440,10 +481,14 @@ export function collectRepoStats(
   since: Date | null
 ): RepoStats | null {
   const identities = gitIdentities(root);
+  /* With no identity there is no honest way to distinguish this builder's
+     work from collaborators'. Returning null keeps "unknown" from becoming
+     "credit every author in the repository". */
+  if (identities.size === 0) return null;
   const raw = runGit(
     [
       "log",
-      "HEAD",
+      shippedRef(root),
       `--format=${RECORD}%H${UNIT}%aE${UNIT}%cE${UNIT}%aI${UNIT}%P${UNIT}%(trailers:key=Co-authored-by,valueonly,separator=${TRAILER})${UNIT}%s`,
       "--numstat",
       /* Follow content through renames and copies rather than scoring a moved

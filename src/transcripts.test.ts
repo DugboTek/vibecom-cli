@@ -220,12 +220,13 @@ test("claude code: synthetic messages are free without denting coverage", () => 
     { type: "user", sessionId: "s-syn", cwd: "/code/app", message: { content: SECRET } },
     {
       type: "assistant",
-      message: { model: "<synthetic>", usage: { input_tokens: 7, output_tokens: 3 } },
+      message: { model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0 } },
     },
   ]);
   const u = parserFor("claude-code")(file, 0)!;
   assert.equal(u.costUsd, 0);
   assert.equal(u.unpricedTokens, 0, "never billable, so not a pricing gap");
+  assert.deepEqual(u.modelUsage, [], "a zero-token synthetic is not a model used");
 });
 
 test("claude code: re-parsing a transcript yields the same cost", () => {
@@ -252,6 +253,106 @@ test("claude code: re-parsing a transcript yields the same cost", () => {
   assert.ok(first.costUsd > 0, "the fixture actually prices to something");
   assert.equal(first.costUsd, second.costUsd);
   assert.equal(first.unpricedTokens, second.unpricedTokens);
+});
+
+test("claude code: streamed content blocks count one API message once", () => {
+  const file = jsonl("cc-stream.jsonl", [
+    {
+      type: "user",
+      uuid: "turn-1",
+      sessionId: "s-stream",
+      cwd: "/code/app",
+      message: { content: "go" },
+    },
+    {
+      type: "assistant",
+      message: {
+        id: "msg-1",
+        model: "claude-opus-5",
+        usage: ccUsage(100, 5),
+      },
+    },
+    {
+      type: "assistant",
+      message: {
+        id: "msg-1",
+        model: "claude-opus-5",
+        usage: ccUsage(100, 12),
+      },
+    },
+  ]);
+  const parsed = parserFor("claude-code")(file, 0)!;
+  assert.equal(parsed.inputTokens, 100, "invariant input is not repeated");
+  assert.equal(parsed.outputTokens, 12, "the final streamed output wins");
+  assert.equal(parsed.cacheReadTokens, 5);
+});
+
+test("claude code: resumes dedupe replays while child-agent messages remain", () => {
+  const first = jsonl("cc-tree/first.jsonl", [
+    {
+      type: "user",
+      uuid: "human-1",
+      sessionId: "tree",
+      cwd: "/code/app",
+      message: { content: "build" },
+    },
+    {
+      type: "assistant",
+      sessionId: "tree",
+      message: { id: "m1", model: "claude-opus-5", usage: ccUsage(100, 5) },
+    },
+  ]);
+  const resumed = jsonl("cc-tree/resumed.jsonl", [
+    {
+      type: "user",
+      uuid: "human-1",
+      sessionId: "tree",
+      cwd: "/code/app",
+      message: { content: "build" },
+    },
+    {
+      type: "assistant",
+      sessionId: "tree",
+      message: { id: "m1", model: "claude-opus-5", usage: ccUsage(100, 9) },
+    },
+    {
+      type: "assistant",
+      sessionId: "tree",
+      message: { id: "m2", model: "claude-haiku-4-5", usage: ccUsage(40, 3) },
+    },
+  ]);
+  const child = jsonl("cc-tree/subagent.jsonl", [
+    {
+      type: "user",
+      uuid: "agent-prompt",
+      sessionId: "tree",
+      cwd: "/code/app",
+      agentId: "agent-1",
+      isSidechain: true,
+      message: { content: "research" },
+    },
+    {
+      type: "assistant",
+      sessionId: "tree",
+      agentId: "agent-1",
+      isSidechain: true,
+      message: { id: "m3", model: "claude-opus-5", usage: ccUsage(60, 4) },
+    },
+  ]);
+
+  const [merged] = groupBySession(
+    [first, resumed, child].map((file) => parserFor("claude-code")(file, 0)!)
+  );
+  assert.equal(merged.turns, 1, "replayed and agent prompts are not human turns");
+  assert.equal(merged.inputTokens, 200, "m1 + m2 + child m3 exactly once");
+  assert.equal(merged.outputTokens, 16);
+  assert.deepEqual(
+    merged.modelUsage?.map((slice) => [slice.model, slice.inputTokens]),
+    [
+      ["claude-opus-5", 160],
+      ["claude-haiku-4-5", 40],
+    ]
+  );
 });
 
 /* ------- codex ------- */
@@ -345,7 +446,7 @@ test("codex: cost is derived from the session totals", () => {
 test("codex: an unrated model reports tokens as unpriced, never as $0", () => {
   const file = jsonl("cx-unrated.jsonl", [
     { type: "session_meta", payload: { session_id: "cx-u", cwd: "/code/app" } },
-    { type: "turn_context", payload: { model: "gpt-5.4" } },
+    { type: "turn_context", payload: { model: "gpt-5.3-codex-spark" } },
     {
       type: "event_msg",
       payload: {
@@ -387,13 +488,74 @@ test("codex: the model comes from turn_context, not session_meta", () => {
 test("codex: an older rollout with the model on session_meta still works", () => {
   const file = jsonl("cx-legacy.jsonl", [
     { type: "session_meta", payload: { session_id: "cx3", model: "gpt-5.1" } },
-    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
   ]);
   assert.equal(
     parserFor("codex")(file, 0)!.model,
     "gpt-5.1",
-    "session_meta wins when both are present — it names the session"
+    "session_meta is the fallback when turn_context is absent"
   );
+});
+
+test("codex: repeated cumulative tuples are ignored and resets are new requests", () => {
+  const tokenCount = (total: number, last: number) => ({
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: { input_tokens: total },
+        last_token_usage: { input_tokens: last },
+      },
+    },
+  });
+  const file = jsonl("cx-requests.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx-requests" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    tokenCount(100, 100),
+    tokenCount(100, 100),
+    { type: "turn_context", payload: { model: "gpt-5.6-terra" } },
+    tokenCount(100, 100),
+    tokenCount(40, 40),
+  ]);
+  const parsed = parserFor("codex")(file, 0)!;
+  assert.equal(parsed.inputTokens, 140);
+  assert.deepEqual(
+    parsed.modelUsage?.map((slice) => [slice.model, slice.inputTokens]),
+    [
+      ["gpt-5.6-sol", 100],
+      ["gpt-5.6-terra", 40],
+    ],
+    "an unchanged replay after a model switch does not move the prior request"
+  );
+});
+
+test("codex: long-context pricing is decided per request, not per session", () => {
+  const file = jsonl("cx-context-price.jsonl", [
+    { type: "session_meta", payload: { session_id: "cx-context" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { input_tokens: 150_000 },
+          last_token_usage: { input_tokens: 150_000 },
+        },
+      },
+    },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { input_tokens: 300_000 },
+          last_token_usage: { input_tokens: 150_000 },
+        },
+      },
+    },
+  ]);
+  const parsed = parserFor("codex")(file, 0)!;
+  assert.equal(parsed.inputTokens, 300_000);
+  assert.equal(parsed.costUsd, 1.5, "two 150K requests remain at the base rate");
 });
 
 /* ------- kimi ------- */
@@ -411,6 +573,28 @@ test("kimi: turn.prompt counts, usage.record accumulates", () => {
   assert.equal(u.outputTokens, 10);
   assert.equal(u.sessionId, "abc");
   assert.equal(u.workspaceHash, "0123456789ab");
+});
+
+test("kimi: every agent wire contributes usage but only main prompts are turns", () => {
+  const main = jsonl(
+    "wd_tree_0123456789ab/session_tree/agents/main/wire.jsonl",
+    [
+      { type: "turn.prompt" },
+      { type: "usage.record", model: "kimi-code/k3", usage: { inputOther: 10 } },
+    ]
+  );
+  const child = jsonl(
+    "wd_tree_0123456789ab/session_tree/agents/child-1/wire.jsonl",
+    [
+      { type: "turn.prompt" },
+      { type: "usage.record", model: "kimi-code/k3", usage: { inputOther: 20 } },
+    ]
+  );
+  const [merged] = groupBySession(
+    [main, child].map((file) => parserFor("kimi")(file, 0)!)
+  );
+  assert.equal(merged.turns, 1);
+  assert.equal(merged.inputTokens, 30);
 });
 
 test("kimi workspace hash is read from the directory name", () => {

@@ -5,6 +5,7 @@ import pc from "picocolors";
 import {
   ApiError,
   BUILD,
+  VERSION,
   selfUpdate,
   type ConsentInfo,
   type Credentials,
@@ -51,6 +52,7 @@ import {
   writeSlot,
 } from "./core";
 import {
+  groupBySession,
   kimiWorkdirs,
   transcriptSources,
   type SessionUsage,
@@ -574,19 +576,10 @@ async function runScan(
   const marks = readScanMarks();
   const kimiDirs = kimiWorkdirs();
 
-  /* Group by session, not by file.
-
-     Claude Code writes a fresh transcript on every resume and replays the
-     prior history into it, so one session can span 149 files each containing a
-     superset of the last. Summing them inflated real usage by ~21x. The
-     authoritative record for a session is its most complete transcript, which
-     is what we restate whenever that session changes. */
-  type Group = { tool: string; sessionId: string; best: SessionUsage | null };
-  const groups = new Map<string, Group>();
-
   const allFiles = transcriptSources().flatMap((source) =>
     source.files.map((file) => ({ source, file }))
   );
+  const parsed: SessionUsage[] = [];
   let read = 0;
   for (const { source, file } of allFiles) {
     read += 1;
@@ -612,35 +605,27 @@ async function runScan(
       if (!usage) continue;
       usage.mtimeMs = stat.mtimeMs;
 
-      const key = `${usage.tool}:${usage.sessionId}`;
-      const group = groups.get(key) ?? {
-        tool: usage.tool,
-        sessionId: usage.sessionId,
-        best: null,
-      };
-      // "most complete" == most lines; ties broken by recency
-      if (
-        !group.best ||
-        usage.lines > group.best.lines ||
-        (usage.lines === group.best.lines && usage.mtimeMs > group.best.mtimeMs)
-      ) {
-        group.best = usage;
-      }
-      groups.set(key, group);
-    }
+      parsed.push(usage);
+  }
+
+  /* Claude resumes replay records with stable message ids, while Claude/Kimi
+     child agents write separate wires that are real additional work. The
+     transcript module knows those formats and merges each execution tree
+     without either multiplying replays or dropping child-agent usage. */
+  const grouped = groupBySession(parsed);
 
   const byProject = new Map<string, { usage: SessionUsage; key: string }[]>();
   let skipped = 0;
   const byTool: Record<string, number> = {};
 
-  for (const [key, group] of groups) {
-    const usage = group.best;
-    if (!usage) continue;
+  for (const usage of grouped) {
+    const key = `${usage.tool}:${usage.sessionId}`;
     const mark = full ? undefined : marks[key];
     if (
       !full &&
       mark &&
       mark.activityVersion === 1 &&
+      mark.scanVersion === 2 &&
       mark.file === usage.file &&
       mark.lines === usage.lines &&
       mark.mtimeMs === usage.mtimeMs
@@ -711,6 +696,7 @@ async function runScan(
             cacheCreationTokens: b.usage.cacheCreationTokens,
             costUsd: b.usage.costUsd,
             unpricedTokens: b.usage.unpricedTokens,
+            modelUsage: b.usage.modelUsage,
             startedAtMs: b.usage.startedAtMs ?? undefined,
             endedAtMs: b.usage.endedAtMs ?? b.usage.mtimeMs,
             activity: b.usage.activity,
@@ -740,7 +726,8 @@ async function runScan(
 /**
  * Read git counters for each linked project and restate them.
  *
- * Totals are cumulative for the window rather than deltas, and every scan
+ * Totals are cumulative over the linked repository's full shipped history,
+ * rather than deltas, and every scan
  * sends the whole figure again. That is what makes `rescan` a repair: the
  * server replaces the previous copy instead of adding to it, so a corrected
  * count converges rather than compounding.
@@ -754,15 +741,19 @@ async function sendGitStats(
     const token = readProjectToken(slot.root);
     if (!token) continue;
 
-    const linkedAt = new Date(slot.linkedAt);
-    const stats = collectRepoStats(
-      slot.root,
-      Number.isFinite(linkedAt.getTime()) ? linkedAt : null
-    );
+    /* Transcript rescans import historical work, so the craft counters beside
+       them must use the same lifetime scope. Applying linkedAt here made a
+       profile compare years of token history with only days of git history. */
+    const stats = collectRepoStats(slot.root, null);
     /* Null means the directory is not a repository, git is unavailable, or
        nothing has been committed yet. None of those are "zero work" — sending
        zeros would overwrite a real count with a wrong one. */
-    if (!stats) continue;
+    if (!stats) {
+      failed.add(
+        `${slot.label}: git stats unavailable (check repository history and user.email)`
+      );
+      continue;
+    }
 
     try {
       await sendRepoStats(slot.origin, token, [stats]);
@@ -790,6 +781,7 @@ function markFor(u: SessionUsage, root: string, model?: string | null) {
     root,
     model: u.model ?? model ?? null,
     activityVersion: 1 as const,
+    scanVersion: 2 as const,
   };
 }
 
@@ -1134,14 +1126,24 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.outro(pc.dim("no other shape exists"));
   },
   status: () => status(),
-  update: async () => {
+  update: async (args = []) => {
     const origin = resolveOrigin();
+    const force = args.includes("--force");
     p.intro(gradient("  update  "));
-    const r = await pulse(`fetching from ${origin}`, selfUpdate(origin));
-    p.log.success(
-      r.updated ? `updated to build ${r.build}` : "already on the latest build"
+    const r = await pulse(
+      `fetching from ${origin}`,
+      selfUpdate(origin, { force })
     );
-    p.outro(pc.dim(`current build ${BUILD}`));
+    if (!r.updated) {
+      p.log.success(`already on ${VERSION}, the latest release`);
+    } else {
+      /* Naming the kind of change is the point of having a version: a user who
+         sees "major" knows to expect something to behave differently, which a
+         build stamp could never tell them. */
+      const kind = r.kind === "unknown" ? "" : ` (${r.kind})`;
+      p.log.success(`updated ${r.from} → ${r.version}${kind}`);
+    }
+    p.outro(pc.dim(`vibecom ${r.updated ? r.version : VERSION} · build ${BUILD}`));
   },
   /**
    * Re-import every session from scratch, restating each one rather than
@@ -1260,7 +1262,7 @@ async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (cmd === undefined) return wizard();
   if (cmd === "--version" || cmd === "version") {
-    console.log(`vibecom 3.2.0 (build ${BUILD})`);
+    console.log(`vibecom ${VERSION} (build ${BUILD})`);
     return;
   }
   const handler = COMMANDS[cmd.replace(/^--/, "")];

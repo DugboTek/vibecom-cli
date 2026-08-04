@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 /* Standalone build, byte-identical to the bundle vibecom.build serves.
@@ -13,6 +13,14 @@ const stamp =
   process.env.VIBECOM_BUILD_STAMP ||
   new Date().toISOString().replace(/\.\d+Z$/, "Z");
 
+/* The release number, read from package.json so there is exactly one place a
+   version is declared. It used to be hand-written in two files that disagreed:
+   `--version` said 3.2.0 while package.json said 0.1.0, so the number a user
+   quoted in a bug report described nothing. */
+const version = JSON.parse(
+  readFileSync(path.join(process.cwd(), "package.json"), "utf8")
+).version;
+
 await build({
   entryPoints: ["src/index.ts"],
   outfile,
@@ -21,10 +29,13 @@ await build({
   target: "node20",
   format: "cjs",
   minify: true,
-  define: { __VIBECOM_BUILD__: JSON.stringify(stamp) },
+  define: {
+    __VIBECOM_BUILD__: JSON.stringify(stamp),
+    __VIBECOM_VERSION__: JSON.stringify(version),
+  },
   banner: { js: "#!/usr/bin/env node" },
   legalComments: "none",
 });
 
 chmodSync(outfile, 0o755);
-console.log(`built dist/cli.js (${stamp})`);
+console.log(`built dist/cli.js (v${version}, ${stamp})`);

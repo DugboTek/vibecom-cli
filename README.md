@@ -137,10 +137,13 @@ drift away from the code.
 
 ### Reproduce the bundle you are running
 
-The build is byte-reproducible. `vibecom --version` prints the build stamp baked
-into your installed copy — pass it back in and you get that exact artifact:
+The build is byte-reproducible. `vibecom --version` prints both the release and
+the build stamp baked into your installed copy — for example
+`vibecom 1.0.0 (build 2026-08-03T21:00:00Z)`. Check out that release and pass the
+stamp back in, and you get that exact artifact:
 
 ```bash
+git checkout cli-v1.0.0   # the release your copy reports
 VIBECOM_BUILD_STAMP=$(vibecom --version | grep -oE '[0-9-]{10}T[0-9:]{8}Z') npm run build
 shasum -a 256 dist/cli.js
 curl -fsSL https://vibecom.build/cli.js | shasum -a 256

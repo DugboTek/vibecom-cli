@@ -29,7 +29,7 @@ appears anywhere in the output.
 
 ## Exactly what is sent
 
-One summary record per coding session, one active-time counter for each UTC
+One summary record per model used in a coding session, one active-time counter for each UTC
 hour the session occupied, and one record per linked repository, to
 `POST /api/v1/logs`:
 
@@ -51,9 +51,10 @@ hour the session occupied, and one record per linked repository, to
 | `ended_at` | string | Last timestamp recorded inside the transcript (ISO 8601), with file modification time used only for older formats that do not timestamp enough records |
 | `bucket_at` | string | Start of a UTC hour containing derived active time (ISO 8601). Present only on `vibecom.session.activity` records |
 | `active_seconds` | number | Active seconds in that hour. Derived from gaps between transcript events; gaps over 15 minutes contribute at most 15 minutes |
-| `commits` | number | Commits you authored in a linked repository since you linked it. Present only on `vibecom.repo` records — see "How git counters are collected" |
+| `commits` | number | Commits you authored in a linked repository's full shipped history. Present only on `vibecom.repo` records — see "How git counters are collected" |
 | `lines_added` | number | Lines added across those commits, excluding lockfiles, vendored directories, build output, and binaries |
 | `lines_removed` | number | Lines removed across those commits, with the same exclusions |
+| `excluded_lines` | number | Generated, vendored, or capped line churn excluded from the displayed line totals |
 | `prs` | number | Distinct pull requests found in the subjects of those commits |
 
 That is the entire payload. See `sendScanned()` in `src/core.ts`.
@@ -65,9 +66,10 @@ service. Transcripts record token counts and a model name but no price, so the
 CLI multiplies those counts by the published list price for that model
 (`src/pricing.ts`) — full rate for input and output, a tenth for cache reads,
 and Anthropic's TTL-dependent premium for cache writes. Claude Code states a
-model on every assistant message, so each message is priced against the model
-that actually served it; Codex and Kimi report one total per session and are
-priced against that.
+model on every assistant message, Codex records the last request beside each
+changed cumulative total, and Kimi records usage in every agent wire. Each
+request/record is priced against the model that served it before per-model
+session slices are uploaded.
 
 It is an API-equivalent figure, not an invoice. A flat monthly subscription
 bills the same regardless, so this answers "what would this volume cost at list
@@ -80,7 +82,7 @@ your volume the figure actually covers.
 
 ### How git counters are collected
 
-`commits`, `lines_added`, `lines_removed`, and `prs` are read from the git
+`commits`, `lines_added`, `lines_removed`, `excluded_lines`, and `prs` are read from the git
 history of the repositories you have linked, by running `git log` locally
 (`src/gitStats.ts`).
 
@@ -93,7 +95,7 @@ running for. Unlike token counts, there is nothing in a transcript to rebuild
 these from, so git is the only way to have them at all.
 
 This reads no prompt, no tool argument, and no file content — only commit
-metadata. Four integers per repository leave your machine. Commit messages,
+metadata. Five integers per repository leave your machine. Commit messages,
 file paths, branch names, and author addresses are read to compute them and
 then dropped.
 
@@ -104,23 +106,23 @@ then dropped.
 - **Work you did through a coding agent counts as yours.** An agent commits
   under its own name and leaves you as the committer; those are credited when
   the committer is you, which is what keeps a colleague's agent work theirs.
-- **Only since you linked the project.** Connecting a repository with years of
-  history does not retroactively credit work you did before joining. The
-  boundary is the *author* date, compared here rather than passed to git's
-  `--since`, which compares the committer date and stops the walk at the first
-  older commit — one rebased commit can otherwise return an empty history.
+- **Full shipped history.** This matches a transcript rescan, which imports the
+  builder's historical coding sessions. Keeping git bounded to link time made
+  the profile compare lifetime tokens with only recent commits and lines.
 - **Generated churn is excluded.** Lockfiles, `node_modules/`, `vendor/`, build
   output, minified bundles, snapshots, and binaries do not count as lines
   written; a single `npm install` would otherwise outweigh a day of real work.
   Anything your repository marks `linguist-generated` or `linguist-vendored` in
   `.gitattributes` is excluded too.
-- **Churn is capped at 2,000 lines per file and 5,000 per commit.** A backstop
-  for generated content no pattern list anticipates. Measured across every
-  repository on one machine, the largest single commit was 1.3 million lines of
-  checked-in JSON snapshots — 41% of all churn everywhere combined — and matched
-  no exclusion rule, because that project stores them in a plain `snapshots/`
-  directory. The thresholds sit well outside hand-written work: the median
-  commit is 121 lines and the 99th percentile is 31,071.
+- **Churn is capped at 2,000 lines per file and 25,000 per commit.** A backstop
+  for generated content no pattern list anticipates — measured across one
+  machine, the largest single commit was 1.3 million lines of checked-in JSON
+  snapshots that matched no rule, because that project stores them in a plain
+  `snapshots/` directory. The thresholds are set high on purpose. They are there
+  to stop an undeclared dump dwarfing everything, not to shape the numbers: on
+  this repository neither cap changes the result at all. If a cap is doing real
+  work on your repository, the honest fix is to mark the offending files
+  generated in `.gitattributes`, not to let the number be reshaped.
 - **Merge commits are not counted** as commits, and their diffs are not counted
   as lines, because everything they contain is already counted once.
 - **Pull requests are read from commit subjects** — the number a forge writes
@@ -132,10 +134,11 @@ then dropped.
 Known limits, stated rather than papered over. A pull request counts when the
 commit that landed it is attributed to you, so one you opened but a teammate
 merged is credited to them. A pull request merged by rebase leaves no marker in
-the history and cannot be detected locally at all. Only work reachable from the
-current branch is counted, so an unmerged branch contributes nothing until it
-lands — late rather than wrong, and it is what keeps a squash-merge from being
-counted twice.
+the history and cannot be detected locally at all. Commit and line counts use
+the fetched remote-default branch when the clone has one, with current `HEAD`
+as the fallback for local-only repositories. An unmerged branch contributes
+nothing until it lands — late rather than wrong, and it is what keeps a
+squash-merge from being counted twice.
 
 `started_at`, `ended_at`, and the hourly active counters come from timestamps
 already present on transcript records. They contain no transcript content and

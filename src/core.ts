@@ -249,6 +249,8 @@ export type ScanMark = {
   model?: string | null;
   /** Forces one snapshot backfill when duration-aware scanning first ships. */
   activityVersion?: 1;
+  /** Parser/rate schema version; a bump forces one corrective full restatement. */
+  scanVersion?: 2;
 };
 
 /** `tool:sessionId` -> what has already been sent for it. */
@@ -273,6 +275,17 @@ export async function sendScanned(
     costUsd: number;
     /** Tokens whose model has no published rate, so coverage stays visible. */
     unpricedTokens: number;
+    /** Token/cost totals split by the model that actually served requests. */
+    modelUsage?: {
+      model: string | null;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWrite5mTokens: number;
+      cacheWrite1hTokens: number;
+      costUsd: number;
+      unpricedTokens: number;
+    }[];
     /** First and last event times read from inside the transcript. */
     startedAtMs?: number;
     endedAtMs?: number;
@@ -288,35 +301,67 @@ export async function sendScanned(
         : { stringValue: value },
   });
 
-  const sessionRecords = sessions.map((s) => ({
-    attributes: [
-      attr("event.name", "vibecom.session"),
-      attr("tool", s.tool),
-      attr("session.id", s.sessionId),
-      ...(s.model ? [attr("model", s.model)] : []),
-      attr("turns", s.turns),
-      attr("input_tokens", s.inputTokens),
-      attr("output_tokens", s.outputTokens),
-      attr("cache_read_tokens", s.cacheReadTokens),
-      attr("cache_creation_tokens", s.cacheCreationTokens),
-      attr("cost_usd", s.costUsd),
-      attr("unpriced_tokens", s.unpricedTokens),
-      ...(s.startedAtMs && Number.isFinite(s.startedAtMs)
-        ? [attr("started_at", new Date(s.startedAtMs).toISOString())]
-        : []),
-      /* These are event times inside the transcript, not the upload time. */
-      ...(s.endedAtMs && Number.isFinite(s.endedAtMs)
-        ? [attr("ended_at", new Date(s.endedAtMs).toISOString())]
-        : []),
-      attr("replace", "true"),
-    ],
-  }));
+  const sessionRecords = sessions.flatMap((s) => {
+    const slices =
+      s.modelUsage && s.modelUsage.length > 0
+        ? s.modelUsage.map((slice) => ({
+            ...slice,
+            cacheCreationTokens:
+              slice.cacheWrite5mTokens + slice.cacheWrite1hTokens,
+          }))
+        : [
+            {
+              model: s.model,
+              inputTokens: s.inputTokens,
+              outputTokens: s.outputTokens,
+              cacheReadTokens: s.cacheReadTokens,
+              cacheCreationTokens: s.cacheCreationTokens,
+              costUsd: s.costUsd,
+              unpricedTokens: s.unpricedTokens,
+            },
+          ];
+
+    return slices.map((slice, index) => ({
+      attributes: [
+        attr("event.name", "vibecom.session"),
+        attr("tool", s.tool),
+        attr("session.id", s.sessionId),
+        ...(slice.model ? [attr("model", slice.model)] : []),
+        /* Session facts belong on one slice only. Token and cost rows belong
+           on every slice, which gives the server a truthful model breakdown
+           without multiplying turns or elapsed time. */
+        ...(index === 0 ? [attr("turns", s.turns)] : []),
+        attr("input_tokens", slice.inputTokens),
+        attr("output_tokens", slice.outputTokens),
+        attr("cache_read_tokens", slice.cacheReadTokens),
+        attr("cache_creation_tokens", slice.cacheCreationTokens),
+        attr("cost_usd", slice.costUsd),
+        attr("unpriced_tokens", slice.unpricedTokens),
+        ...(index === 0 && s.startedAtMs && Number.isFinite(s.startedAtMs)
+          ? [attr("started_at", new Date(s.startedAtMs).toISOString())]
+          : []),
+        /* These are event times inside the transcript, not the upload time. */
+        ...(s.endedAtMs && Number.isFinite(s.endedAtMs)
+          ? [attr("ended_at", new Date(s.endedAtMs).toISOString())]
+          : []),
+        attr("replace", "true"),
+      ],
+    }));
+  });
 
   /* A summary row still lands at the session end. These small hourly records
      are what stop a three-hour chat becoming one spike at scan time. They are
      derived locally and contain only a timestamp plus a counter. */
   const activityRecords = sessions.flatMap((s) =>
-    s.activity.map((bucket) => ({
+    (s.activity.length > 0
+      ? s.activity
+      : [
+          {
+            bucketAtMs: s.endedAtMs ?? Date.now(),
+            seconds: 0,
+          },
+        ]
+    ).map((bucket) => ({
       attributes: [
         attr("event.name", "vibecom.session.activity"),
         attr("tool", s.tool),
@@ -357,6 +402,7 @@ export async function sendRepoStats(
     linesAdded: number;
     linesRemoved: number;
     prs: number;
+    excludedLines: number;
   }[]
 ): Promise<{ accepted: number; dropped: number }> {
   const attr = (key: string, value: string | number) => ({
@@ -374,6 +420,7 @@ export async function sendRepoStats(
       attr("lines_added", repo.linesAdded),
       attr("lines_removed", repo.linesRemoved),
       attr("prs", repo.prs),
+      attr("excluded_lines", repo.excludedLines),
       attr("replace", "true"),
     ],
   }));
@@ -988,11 +1035,16 @@ export const revokeProjectToken = (
 
 /* ------- self update ------- */
 
-declare const __VIBECOM_BUILD__: string;
-
-/** Build stamp injected by scripts/build-cli.mjs. */
-export const BUILD: string =
-  typeof __VIBECOM_BUILD__ === "string" ? __VIBECOM_BUILD__ : "dev";
+/* Re-exported so existing importers keep working; both now come from one place
+   that also owns how two versions compare. */
+export { VERSION, BUILD } from "./version";
+import {
+  VERSION,
+  bumpKind,
+  compareVersions,
+  parseVersion,
+  versionFromBundle,
+} from "./version";
 
 /**
  * Replace this binary with the copy the server is serving.
@@ -1003,8 +1055,14 @@ export const BUILD: string =
  * renames, so an interrupted download cannot leave a broken executable.
  */
 export async function selfUpdate(
-  origin: string
-): Promise<{ updated: boolean; build: string }> {
+  origin: string,
+  options: { force?: boolean } = {}
+): Promise<{
+  updated: boolean;
+  version: string;
+  from: string;
+  kind: ReturnType<typeof bumpKind> | "unknown";
+}> {
   origin = secureOrigin(origin);
   const target = realpath(process.argv[1]);
   let res: Response;
@@ -1019,14 +1077,36 @@ export async function selfUpdate(
   if (!body.startsWith("#!/usr/bin/env node")) {
     throw new ApiError("that does not look like the CLI");
   }
-  const stamp = body.match(/__VIBECOM_BUILD__|"(\d{4}-\d{2}-\d{2}T[\d:]+Z)"/);
-  const remoteBuild = stamp?.[1] ?? "unknown";
-  if (body.includes(`"${BUILD}"`) && BUILD !== "dev") {
-    return { updated: false, build: BUILD };
+
+  const remote = versionFromBundle(body);
+  const here = parseVersion(VERSION);
+  const there = remote ? parseVersion(remote) : null;
+
+  /* Compare releases rather than diffing bytes. The old check asked only
+     whether the remote build stamp differed from the local one, which cannot
+     tell newer from older — so a rollback, or any host briefly serving an
+     earlier bundle, would be installed and reported as an update. Refusing to
+     go backwards is the whole point of having a version. */
+  if (here && there && !options.force) {
+    const order = compareVersions(here, there);
+    if (order === 0) {
+      return { updated: false, version: VERSION, from: VERSION, kind: "none" };
+    }
+    if (order > 0) {
+      throw new ApiError(
+        `${origin} is serving ${remote}, older than the installed ${VERSION}. ` +
+          `Re-run with --force to install it anyway.`
+      );
+    }
   }
 
   const tmp = target + ".new";
   fs.writeFileSync(tmp, body, { mode: 0o755 });
   fs.renameSync(tmp, target);
-  return { updated: true, build: remoteBuild };
+  return {
+    updated: true,
+    version: remote ?? "unknown",
+    from: VERSION,
+    kind: here && there ? bumpKind(here, there) : "unknown",
+  };
 }

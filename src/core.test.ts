@@ -423,6 +423,94 @@ test("a same-origin redirect is still refused rather than looped", async () => {
   }
 });
 
+test("scanned sessions preserve per-model token slices without repeating turns", async () => {
+  type WireAttribute = {
+    key: string;
+    value: { stringValue?: string; doubleValue?: number };
+  };
+  type WireRecord = { attributes: WireAttribute[] };
+  type WirePayload = {
+    resourceLogs: { scopeLogs: { logRecords: WireRecord[] }[] }[];
+  };
+  const original = globalThis.fetch;
+  let sent: WirePayload | undefined;
+  globalThis.fetch = (async (_input, init) => {
+    sent = JSON.parse(String(init?.body));
+    return Response.json({ accepted: 2, dropped: 0 });
+  }) as typeof fetch;
+  try {
+    await sendScanned("https://example.com", "tok", [
+      {
+        tool: "claude-code",
+        sessionId: "mixed",
+        model: "claude-opus-5",
+        turns: 3,
+        inputTokens: 30,
+        outputTokens: 3,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        costUsd: 1,
+        unpricedTokens: 0,
+        activity: [],
+        modelUsage: [
+          {
+            model: "claude-opus-5",
+            inputTokens: 20,
+            outputTokens: 2,
+            cacheReadTokens: 0,
+            cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0,
+            costUsd: 0.8,
+            unpricedTokens: 0,
+          },
+          {
+            model: "claude-haiku-4-5",
+            inputTokens: 10,
+            outputTokens: 1,
+            cacheReadTokens: 0,
+            cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0,
+            costUsd: 0.2,
+            unpricedTokens: 0,
+          },
+        ],
+      },
+    ]);
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  assert.ok(sent);
+  const records = sent.resourceLogs[0].scopeLogs[0].logRecords;
+  assert.equal(records.length, 3, "two model slices plus the activity reset marker");
+  const sessionRecords = records.filter((record) =>
+    record.attributes.some(
+      (attribute) =>
+        attribute.key === "event.name" &&
+        attribute.value.stringValue === "vibecom.session"
+    )
+  );
+  const attrs = sessionRecords.map((record) =>
+    Object.fromEntries(
+      record.attributes.map((attribute) => [
+        attribute.key,
+        attribute.value.stringValue ?? attribute.value.doubleValue,
+      ])
+    )
+  );
+  assert.deepEqual(
+    attrs.map((entry) => [entry.model, entry.input_tokens]),
+    [
+      ["claude-opus-5", 20],
+      ["claude-haiku-4-5", 10],
+    ]
+  );
+  assert.deepEqual(
+    attrs.map((entry) => entry.turns),
+    [3, undefined]
+  );
+});
+
 test("a long scan yields, so a spinner can actually paint", async () => {
   /* The command looked frozen because scanning is synchronous file I/O across
      thousands of transcripts: it held the event loop for the whole run, so no

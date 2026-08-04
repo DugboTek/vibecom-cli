@@ -306,6 +306,8 @@ test("pull request numbers are recognised across forges", () => {
   assert.equal(pullRequestRef("Merge pull request #42 from me/feature"), "42");
   assert.equal(pullRequestRef("Add the thing (#123)"), "123");
   assert.equal(pullRequestRef("Merged in feat (pull request #7)"), "7");
+  assert.equal(pullRequestRef("ship the redesign (PR #80)"), "80");
+  assert.equal(pullRequestRef("feature (#79) plus release notes"), "79");
   assert.equal(pullRequestRef("See merge request group/proj!99"), "99");
 });
 
@@ -437,6 +439,29 @@ test("a real repository attributes only the configured identity", () => {
 test("the identity set comes from the repository's own config", () => {
   const dir = repo("identity");
   assert.ok(gitIdentities(dir).has(ME));
+});
+
+test("shipped stats use the fetched default branch, not a feature checkout", () => {
+  const dir = repo("remote-default");
+  commit(dir, { "main.ts": lines(5) }, "shipped");
+  execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], {
+    cwd: dir,
+    stdio: "ignore",
+  });
+  execFileSync(
+    "git",
+    ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+    { cwd: dir, stdio: "ignore" }
+  );
+  execFileSync("git", ["switch", "-qc", "feature"], {
+    cwd: dir,
+    stdio: "ignore",
+  });
+  commit(dir, { "feature.ts": lines(50) }, "not shipped yet");
+
+  const stats = collectRepoStats(dir, null)!;
+  assert.equal(stats.commits, 1);
+  assert.equal(stats.linesAdded, 5);
 });
 
 test("since bounds the window", () => {

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { priceUsage } from "./pricing";
+import { priceUsage, totalTokens as pricedTokenTotal } from "./pricing";
+import type { TokenUsage } from "./pricing";
 
 /**
  * Read what the coding tools already write to disk.
@@ -44,6 +45,8 @@ export type SessionUsage = {
    * price this" stays distinguishable from a $0 that means "this was free".
    */
   unpricedTokens: number;
+  /** Token and cost totals split by the model that actually served them. */
+  modelUsage?: ModelUsage[];
   /** human turns; 1 means a single prompt produced the whole session */
   turns: number;
   /** First and last timestamp written inside the transcript itself. */
@@ -60,6 +63,37 @@ export type SessionUsage = {
   mtimeMs: number;
   file: string;
 };
+
+export type ModelUsage = TokenUsage & {
+  model: string | null;
+  costUsd: number;
+  unpricedTokens: number;
+};
+
+type ClaudeMessage = {
+  model: string | null;
+  usage: TokenUsage;
+  timestamp: number | null;
+};
+
+type ClaudeDetails = {
+  messages: Map<string, ClaudeMessage>;
+  turns: Set<string>;
+  timestamps: Set<number>;
+  main: boolean;
+  /** Replayed transcripts are safe to union only when API/turn ids exist. */
+  mergeSafeMessages: boolean;
+  mergeSafeTurns: boolean;
+};
+
+/* Message and record IDs are needed only while transcript files are merged.
+   A WeakMap keeps them private to this module, so SessionUsage still exposes
+   derived numbers only and nothing identifying is sent or persisted. */
+const CLAUDE_DETAILS = new WeakMap<SessionUsage, ClaudeDetails>();
+const KIMI_DETAILS = new WeakMap<
+  SessionUsage,
+  { timestamps: Set<number>; main: boolean }
+>();
 
 const home = os.homedir();
 const num = (v: unknown): number =>
@@ -132,6 +166,66 @@ function finishTiming(u: SessionUsage, timestamps: number[]): SessionUsage {
   return u;
 }
 
+function applyModelUsage(
+  u: SessionUsage,
+  messages: Iterable<ClaudeMessage>,
+  allowLongContext = true
+) {
+  const byModel = new Map<string, ModelUsage>();
+  for (const message of messages) {
+    const key = message.model ?? "";
+    let slice = byModel.get(key);
+    if (!slice) {
+      slice = {
+        model: message.model,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWrite5mTokens: 0,
+        cacheWrite1hTokens: 0,
+        costUsd: 0,
+        unpricedTokens: 0,
+      };
+      byModel.set(key, slice);
+    }
+    slice.inputTokens += message.usage.inputTokens;
+    slice.outputTokens += message.usage.outputTokens;
+    slice.cacheReadTokens += message.usage.cacheReadTokens;
+    slice.cacheWrite5mTokens += message.usage.cacheWrite5mTokens;
+    slice.cacheWrite1hTokens += message.usage.cacheWrite1hTokens;
+    const cost = priceUsage(message.model, message.usage, allowLongContext);
+    if (cost === null) slice.unpricedTokens += pricedTokenTotal(message.usage);
+    else slice.costUsd += cost;
+  }
+
+  const slices = [...byModel.values()]
+    .filter(
+      (slice) =>
+        pricedTokenTotal(slice) > 0 ||
+        slice.costUsd > 0 ||
+        slice.unpricedTokens > 0
+    )
+    .sort((a, b) => pricedTokenTotal(b) - pricedTokenTotal(a));
+  u.modelUsage = slices;
+  u.inputTokens = slices.reduce((sum, slice) => sum + slice.inputTokens, 0);
+  u.outputTokens = slices.reduce((sum, slice) => sum + slice.outputTokens, 0);
+  u.cacheReadTokens = slices.reduce(
+    (sum, slice) => sum + slice.cacheReadTokens,
+    0
+  );
+  u.cacheCreationTokens = slices.reduce(
+    (sum, slice) =>
+      sum + slice.cacheWrite5mTokens + slice.cacheWrite1hTokens,
+    0
+  );
+  u.costUsd = slices.reduce((sum, slice) => sum + slice.costUsd, 0);
+  u.unpricedTokens = slices.reduce(
+    (sum, slice) => sum + slice.unpricedTokens,
+    0
+  );
+  u.model = slices.find((slice) => pricedTokenTotal(slice) > 0)?.model ?? null;
+}
+
 /**
  * Price a session from its final totals.
  *
@@ -143,22 +237,26 @@ function finishTiming(u: SessionUsage, timestamps: number[]): SessionUsage {
  * reaches this path.
  */
 function priceFromTotals(u: SessionUsage): void {
-  const usd = priceUsage(u.model, {
-    inputTokens: u.inputTokens,
-    outputTokens: u.outputTokens,
-    cacheReadTokens: u.cacheReadTokens,
-    cacheWrite5mTokens: u.cacheCreationTokens,
-    cacheWrite1hTokens: 0,
-  });
-  if (usd === null) {
-    u.unpricedTokens =
-      u.inputTokens +
-      u.outputTokens +
-      u.cacheReadTokens +
-      u.cacheCreationTokens;
-  } else {
-    u.costUsd = usd;
-  }
+  applyModelUsage(
+    u,
+    [
+      {
+        model: u.model,
+        usage: {
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
+          cacheReadTokens: u.cacheReadTokens,
+          cacheWrite5mTokens: u.cacheCreationTokens,
+          cacheWrite1hTokens: 0,
+        },
+        timestamp: null,
+      },
+    ],
+    /* A session aggregate cannot establish whether any individual request
+       crossed 272K. Applying the uplift to all of it would be a known
+       overcharge, so legacy records without request slices stay at base rate. */
+    false
+  );
 }
 
 /**
@@ -230,18 +328,37 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
     mtimeMs: fs.statSync(file).mtimeMs,
     file,
   };
-  const timestamps: number[] = [];
+  const details: ClaudeDetails = {
+    messages: new Map(),
+    turns: new Set(),
+    timestamps: new Set(),
+    main: true,
+    mergeSafeMessages: true,
+    mergeSafeTurns: true,
+  };
+  let recordIndex = skip;
 
   for (const raw of readLines(file, skip)) {
+    recordIndex++;
     const rec = raw as Rec;
     const timestamp = recordTimeMs(rec);
-    if (timestamp !== null) timestamps.push(timestamp);
+    if (timestamp !== null) details.timestamps.add(timestamp);
     if (typeof rec.sessionId === "string") u.sessionId ||= rec.sessionId;
     if (typeof rec.cwd === "string") u.cwd ||= rec.cwd;
-    if (isHumanTurn(rec)) u.turns++;
+    if (rec.isSidechain === true || typeof rec.agentId === "string") {
+      details.main = false;
+    }
+    if (
+      isHumanTurn(rec) &&
+      rec.isSidechain !== true &&
+      typeof rec.agentId !== "string"
+    ) {
+      const id = typeof rec.uuid === "string" ? rec.uuid : null;
+      if (!id) details.mergeSafeTurns = false;
+      details.turns.add(id ?? `${file}:turn:${recordIndex}`);
+    }
 
     const message = rec.message as Rec | undefined;
-    if (typeof message?.model === "string") u.model ||= message.model;
     const usage = message?.usage as Rec | undefined;
     if (!usage) continue;
 
@@ -249,11 +366,6 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
     const outputTokens = num(usage.output_tokens);
     const cacheReadTokens = num(usage.cache_read_input_tokens);
     const cacheCreationTokens = num(usage.cache_creation_input_tokens);
-    u.inputTokens += inputTokens;
-    u.outputTokens += outputTokens;
-    u.cacheReadTokens += cacheReadTokens;
-    u.cacheCreationTokens += cacheCreationTokens;
-
     /* Cache writes are billed by TTL, and the hour tier costs 1.6x the
        five-minute one. `cache_creation` states the hour figure; taking the
        rest as five-minute conserves the documented total even on older
@@ -265,29 +377,47 @@ function parseClaudeCode(file: string, skip: number): SessionUsage | null {
       cacheCreationTokens - cacheWrite1hTokens
     );
 
-    /* Priced per message rather than per session: a session that switches
-       models mid-way would otherwise bill all of its tokens at whichever
-       model happened to speak first. */
-    const usd = priceUsage(
-      typeof message?.model === "string" ? message.model : null,
-      {
+    const messageId =
+      typeof message?.id === "string"
+        ? message.id
+        : typeof rec.requestId === "string"
+          ? rec.requestId
+          : typeof rec.uuid === "string"
+            ? rec.uuid
+            : null;
+    if (!messageId) details.mergeSafeMessages = false;
+    const key = messageId ?? `${file}:message:${recordIndex}`;
+    const candidate: ClaudeMessage = {
+      model: typeof message?.model === "string" ? message.model : null,
+      usage: {
         inputTokens,
         outputTokens,
         cacheReadTokens,
         cacheWrite5mTokens,
         cacheWrite1hTokens,
-      }
-    );
-    if (usd === null) {
-      u.unpricedTokens +=
-        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
-    } else {
-      u.costUsd += usd;
+      },
+      timestamp,
+    };
+    const previous = details.messages.get(key);
+    /* Claude repeats one assistant message as its content blocks stream. The
+       input/cache fields remain invariant while output grows, so only the
+       final (largest) output is a billable API response. */
+    if (
+      !previous ||
+      candidate.usage.outputTokens > previous.usage.outputTokens ||
+      (candidate.usage.outputTokens === previous.usage.outputTokens &&
+        (candidate.timestamp ?? 0) >= (previous.timestamp ?? 0))
+    ) {
+      details.messages.set(key, candidate);
     }
   }
 
   u.sessionId ||= path.basename(file, ".jsonl");
-  return finishTiming(u, timestamps);
+  u.turns = details.turns.size;
+  applyModelUsage(u, details.messages.values());
+  finishTiming(u, [...details.timestamps]);
+  CLAUDE_DETAILS.set(u, details);
+  return u;
 }
 
 /* ---------------------------------------------------------------- codex --- */
@@ -314,9 +444,14 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
   };
   const timestamps: number[] = [];
 
-  // token_count carries a running total, so take the last one rather than
-  // summing — adding every snapshot would multiply the real usage.
+  // token_count repeats its running total after non-billable events. A changed
+  // cumulative tuple identifies one new request; last_token_usage is that
+  // request's usage and preserves the boundary needed for long-context rates.
   let lastTotal: Rec | null = null;
+  let previousTuple: string | null = null;
+  let sessionModel: string | null = null;
+  let activeModel: string | null = null;
+  const requests: ClaudeMessage[] = [];
 
   for (const raw of readLines(file, skip)) {
     const rec = raw as Rec;
@@ -328,24 +463,60 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
       if (typeof payload.session_id === "string") u.sessionId ||= payload.session_id;
       if (typeof payload.cwd === "string") u.cwd ||= payload.cwd;
       // Older rollouts carried the model here; current ones do not.
-      if (typeof payload.model === "string") u.model ||= payload.model;
+      if (typeof payload.model === "string") {
+        sessionModel ||= payload.model;
+        activeModel ||= payload.model;
+      }
     }
     /* Current Codex writes the model on turn_context, not session_meta —
        session_meta only has model_provider. Without this every Codex session
        reports no model, so its tokens land in the totals but never appear in
        any per-model breakdown. */
     if (rec.type === "turn_context" && typeof payload.model === "string") {
-      u.model ||= payload.model;
+      activeModel = payload.model;
     }
     if (payload.type === "user_message") u.turns++;
     if (payload.type === "token_count") {
       const info = (payload.info ?? {}) as Rec;
       const total = info.total_token_usage as Rec | undefined;
-      if (total) lastTotal = total;
+      if (total) {
+        lastTotal = total;
+        const tuple = JSON.stringify([
+          num(total.input_tokens),
+          num(total.cached_input_tokens),
+          num(total.output_tokens),
+          num(total.reasoning_output_tokens),
+          num(total.cache_write_input_tokens),
+        ]);
+        if (tuple !== previousTuple) {
+          previousTuple = tuple;
+          const last = info.last_token_usage as Rec | undefined;
+          if (last) {
+            const wholeInput = num(last.input_tokens);
+            const cacheReadTokens = Math.min(
+              num(last.cached_input_tokens),
+              wholeInput
+            );
+            requests.push({
+              model: activeModel ?? sessionModel,
+              usage: {
+                inputTokens: wholeInput - cacheReadTokens,
+                outputTokens: num(last.output_tokens),
+                cacheReadTokens,
+                cacheWrite5mTokens: num(last.cache_write_input_tokens),
+                cacheWrite1hTokens: 0,
+              },
+              timestamp,
+            });
+          }
+        }
+      }
     }
   }
 
-  if (lastTotal) {
+  if (requests.length > 0) {
+    applyModelUsage(u, requests);
+  } else if (lastTotal) {
     /* `input_tokens` is the whole input, with `cached_input_tokens` a subset of
        it — the transcript's own `total_tokens` equals input plus output, so
        cached is already inside that figure. Reading the two as siblings counted
@@ -357,9 +528,12 @@ function parseCodex(file: string, skip: number): SessionUsage | null {
     u.inputTokens = wholeInput - u.cacheReadTokens;
     u.outputTokens = num(lastTotal.output_tokens);
     u.cacheCreationTokens = num(lastTotal.cache_write_input_tokens);
+    u.model = activeModel ?? sessionModel;
+    priceFromTotals(u);
+  } else {
+    u.model = activeModel ?? sessionModel;
   }
   u.sessionId ||= path.basename(file, ".jsonl");
-  priceFromTotals(u);
   return finishTiming(u, timestamps);
 }
 
@@ -408,7 +582,13 @@ function parseKimi(file: string, skip: number): SessionUsage | null {
   u.sessionId ||= sessionDir?.replace("session_", "") ?? path.basename(file);
   u.workspaceHash = kimiWorkspaceHash(file);
   priceFromTotals(u);
-  return finishTiming(u, timestamps);
+  finishTiming(u, timestamps);
+  const agentIndex = parts.lastIndexOf("agents");
+  KIMI_DETAILS.set(u, {
+    timestamps: new Set(timestamps),
+    main: agentIndex < 0 || parts[agentIndex + 1] === "main",
+  });
+  return u;
 }
 
 /**
@@ -492,27 +672,115 @@ export function kimiWorkdirs(): Map<string, string> {
   return map;
 }
 
-/**
- * Reduce transcripts to one entry per session, keeping the most complete.
- *
- * Claude Code starts a fresh transcript on every resume and replays the prior
- * history into it, so a single session can span a hundred-plus files each
- * containing a superset of the last. Summing them multiplies real usage — on
- * one real machine by 8x overall and 21x for the worst session. The
- * authoritative record is the longest transcript, with recency breaking ties.
- */
+const mostComplete = (usages: SessionUsage[]): SessionUsage =>
+  usages.reduce((best, usage) =>
+    usage.lines > best.lines ||
+    (usage.lines === best.lines && usage.mtimeMs > best.mtimeMs)
+      ? usage
+      : best
+  );
+
+function groupedIdentity(
+  representative: SessionUsage,
+  usages: SessionUsage[]
+): SessionUsage {
+  return {
+    ...representative,
+    /* The scanner watermark must describe the entire execution tree. A stable
+       synthetic name plus summed lines/max mtime changes when any child wire
+       changes without exposing transcript paths to the server. */
+    file: `group:${representative.tool}:${representative.sessionId}`,
+    lines: usages.reduce((sum, usage) => sum + usage.lines, 0),
+    mtimeMs: Math.max(...usages.map((usage) => usage.mtimeMs)),
+  };
+}
+
+function mergeClaude(usages: SessionUsage[]): SessionUsage {
+  const details = usages.map((usage) => CLAUDE_DETAILS.get(usage));
+  if (
+    details.some(
+      (detail) =>
+        !detail || !detail.mergeSafeMessages || !detail.mergeSafeTurns
+    )
+  ) {
+    /* Older transcript formats lack stable ids. For those, longest-file wins
+       is conservative: unioning file-local fallback ids would count every
+       replay as new work. */
+    return mostComplete(usages);
+  }
+
+  const typed = details as ClaudeDetails[];
+  const main = usages.filter((_, index) => typed[index].main);
+  const representative = mostComplete(main.length > 0 ? main : usages);
+  const merged = groupedIdentity(representative, usages);
+  const messages = new Map<string, ClaudeMessage>();
+  const turns = new Set<string>();
+  const timestamps = new Set<number>();
+
+  for (const detail of typed) {
+    for (const [id, candidate] of detail.messages) {
+      const previous = messages.get(id);
+      if (
+        !previous ||
+        candidate.usage.outputTokens > previous.usage.outputTokens ||
+        (candidate.usage.outputTokens === previous.usage.outputTokens &&
+          (candidate.timestamp ?? 0) >= (previous.timestamp ?? 0))
+      ) {
+        messages.set(id, candidate);
+      }
+    }
+    for (const turn of detail.turns) turns.add(turn);
+    for (const timestamp of detail.timestamps) timestamps.add(timestamp);
+  }
+
+  merged.turns = turns.size;
+  applyModelUsage(merged, messages.values());
+  finishTiming(merged, [...timestamps]);
+  CLAUDE_DETAILS.set(merged, {
+    messages,
+    turns,
+    timestamps,
+    main: true,
+    mergeSafeMessages: true,
+    mergeSafeTurns: true,
+  });
+  return merged;
+}
+
+function mergeKimi(usages: SessionUsage[]): SessionUsage {
+  const details = usages.map((usage) => KIMI_DETAILS.get(usage));
+  if (details.some((detail) => !detail)) return mostComplete(usages);
+  const typed = details as NonNullable<ReturnType<typeof KIMI_DETAILS.get>>[];
+  const main = usages.filter((_, index) => typed[index].main);
+  const representative = mostComplete(main.length > 0 ? main : usages);
+  const merged = groupedIdentity(representative, usages);
+  const messages: ClaudeMessage[] = [];
+  const timestamps = new Set<number>();
+
+  for (const [index, usage] of usages.entries()) {
+    for (const slice of usage.modelUsage ?? []) {
+      messages.push({ model: slice.model, usage: slice, timestamp: null });
+    }
+    for (const timestamp of typed[index].timestamps) timestamps.add(timestamp);
+  }
+  merged.turns = main.reduce((sum, usage) => sum + usage.turns, 0);
+  applyModelUsage(merged, messages);
+  finishTiming(merged, [...timestamps]);
+  KIMI_DETAILS.set(merged, { timestamps, main: true });
+  return merged;
+}
+
+/** Reduce transcript files to one complete account-level usage per session. */
 export function groupBySession(usages: SessionUsage[]): SessionUsage[] {
-  const best = new Map<string, SessionUsage>();
+  const groups = new Map<string, SessionUsage[]>();
   for (const u of usages) {
     const key = `${u.tool}:${u.sessionId}`;
-    const cur = best.get(key);
-    if (
-      !cur ||
-      u.lines > cur.lines ||
-      (u.lines === cur.lines && u.mtimeMs > cur.mtimeMs)
-    ) {
-      best.set(key, u);
-    }
+    groups.set(key, [...(groups.get(key) ?? []), u]);
   }
-  return [...best.values()];
+  return [...groups.values()].map((group) => {
+    if (group.length === 1) return group[0];
+    if (group[0].tool === "claude-code") return mergeClaude(group);
+    if (group[0].tool === "kimi") return mergeKimi(group);
+    return mostComplete(group);
+  });
 }
