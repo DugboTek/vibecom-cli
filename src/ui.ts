@@ -153,9 +153,17 @@ export async function pulse<T>(
     return work;
   }
   let alive = true;
-  work.finally(() => {
+  /* `.finally` returns a *new* promise that rejects whenever `work` does, and
+     nothing was awaiting this one. The caller's own catch handled the promise
+     pulse returns, so the error was reported properly — and then this orphan
+     rejected with no handler and Node killed the process, printing a stack
+     trace through the minified bundle over whatever the caller had just said.
+     Every failure inside a spinner looked like a crash in the CLI itself.
+     The catch here is not swallowing the error; `await work` below still
+     throws it. This branch exists only to stop the spinner. */
+  void work.finally(() => {
     alive = false;
-  });
+  }).catch(() => {});
   const spin = (async () => {
     for (let f = 0; alive; f++) {
       const dots = ".".repeat(f % 4).padEnd(3);

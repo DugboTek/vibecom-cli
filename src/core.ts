@@ -83,6 +83,21 @@ function writePrivateFile(file: string, body: string) {
   writeAtomicFile(file, body, 0o600);
 }
 
+/**
+ * Loopback never reaches a network, so there is no transport to eavesdrop on.
+ * Requiring TLS here would only mean a self-signed certificate and a disabled
+ * verifier, which is strictly worse: it teaches the habit of turning checks off
+ * to get work done. Everything routable still has to be HTTPS.
+ */
+function isLoopback(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname === "::1"
+  );
+}
+
 /** Only use origins on a transport that cannot disclose bearer credentials. */
 export function secureOrigin(origin: string): string {
   let url: URL;
@@ -91,8 +106,11 @@ export function secureOrigin(origin: string): string {
   } catch {
     throw new ApiError("origin must be an absolute HTTPS URL");
   }
+  const transportIsSafe =
+    url.protocol === "https:" ||
+    (url.protocol === "http:" && isLoopback(url.hostname));
   if (
-    url.protocol !== "https:" ||
+    !transportIsSafe ||
     !url.hostname ||
     url.username ||
     url.password ||
@@ -100,7 +118,10 @@ export function secureOrigin(origin: string): string {
     url.search ||
     url.hash
   ) {
-    throw new ApiError("origin must be an HTTPS origin without userinfo or a path");
+    throw new ApiError(
+      "origin must be an HTTPS origin without userinfo or a path " +
+        "(http is allowed only for localhost)"
+    );
   }
   return url.origin;
 }
@@ -966,6 +987,27 @@ async function request<T>(
 
   const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
+    /* The server says "invalid token", which is true and useless: it names the
+       thing that failed, not the thing to do. A stored credential goes stale
+       for ordinary reasons — signing out elsewhere, a revoked session — and
+       the person reading this cannot act on a noun. Name the one command that
+       fixes it, the way the redirect case above does. */
+    if (res.status === 401 || res.status === 403) {
+      throw new ApiError(
+        `your sign-in for ${origin} has expired — run \`vibecom login\` to sign in again`
+      );
+    }
+    /* A 5xx here already survived four retries, so it is the server being
+       broken rather than a blip. "HTTP 500" invites the reader to go looking
+       for the mistake they made; there isn't one, and nothing they change
+       locally will help. Say whose problem it is and that waiting is the
+       action. */
+    if (res.status >= 500) {
+      throw new ApiError(
+        `${origin} is failing to respond (HTTP ${res.status}). Nothing is wrong ` +
+          `on your machine — wait a few minutes and run the same command again.`
+      );
+    }
     throw new ApiError(
       typeof body.error === "string" ? body.error : `HTTP ${res.status}`
     );

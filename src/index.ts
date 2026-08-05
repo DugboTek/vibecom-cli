@@ -385,7 +385,15 @@ async function runLink(cred: Credentials, searchDir: string): Promise<number> {
   let tier: Tier = 1;
   let consent: ConsentInfo | null = null;
   let stage: "projects" | "tier" | "review" = "projects";
-  let initialSelection = [here ?? repos[0].root];
+  /* Preselect through the same predicate that decides what is safe to choose
+     automatically, rather than "whatever repo I'm standing in". Those differed:
+     quickStart would refuse an employer's repo, then hand off to this chooser
+     with that exact repo already ticked — telling the person we would not guess
+     while a guess sat on screen, pre-made. An unsafe repo now starts unticked
+     and requires a deliberate keystroke. */
+  let initialSelection = recommendedRepos(repos, cred.username, here).map(
+    (repo) => repo.root
+  );
 
   /* Nothing is written and no token is minted until the review step is
      accepted, so backing up is just another turn of this loop. Selections and
@@ -444,7 +452,16 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
   );
   const selected = recommendedRepos(repos, cred.username, projectRoot());
   if (selected.length === 0) {
-    p.log.info("I couldn't safely choose a personal project for you.");
+    /* Naming only what the tool failed to do leaves the person to guess
+       whether something is broken. The cause is almost always benign — the
+       repos here belong to an employer or org — and the next screen is a
+       normal chooser, so say both before it appears. */
+    p.log.info(
+      repos.length === 0
+        ? `No git projects under ${searchDir} yet — pick one yourself below.`
+        : "None of these projects are clearly yours, so I won't guess — " +
+            "employer and client code stays unconnected unless you say so."
+    );
     return runLink(cred, searchDir);
   }
 
@@ -460,7 +477,15 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
   p.note(
     [
       `${pc.bold("Projects")}  ${selected.map((repo) => repo.label).join(", ")}`,
-      `${pc.bold("Found")}     ${tools.length > 0 ? tools.join(" + ") : "supported session files"}`,
+      /* Claiming "supported session files" when the scan found none states a
+         discovery that did not happen, and the first screen is where a
+         beginner builds their model of what this tool can see. Say the true
+         thing — nothing yet — and say what makes it change. */
+      `${pc.bold("Found")}     ${
+        tools.length > 0
+          ? tools.join(" + ")
+          : "no past sessions yet — new ones will be counted"
+      }`,
       "",
       "Vibecom will import token counters and build activity already on",
       "this computer, then keep these projects up to date.",
@@ -484,7 +509,16 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
 
   if (!(await reviewOwnership(selected, cred, origin))) return 0;
   const count = await applyLinks(cred, origin, selected, 1);
-  if (count === 0) return 0;
+  /* applyLinks prints why each project failed, then this function used to
+     return quietly into the menu. A red line followed by a normal menu reads
+     as "that worked, what's next". State the outcome. */
+  if (count === 0) {
+    p.log.warn(
+      "Nothing was connected, and nothing is being collected. " +
+        "Fix the problem above, then choose Connect a project."
+    );
+    return 0;
+  }
 
   const scan = await pulse("importing your existing activity", runScan());
   for (const failure of scan.failed) p.log.warn(failure);
@@ -801,7 +835,13 @@ async function menu(cred: Credentials): Promise<boolean> {
     await p.select({
       message: "What next?",
       options: [
-        { value: "link", label: "Connect more projects" },
+        {
+          value: "link",
+          // "more" is a claim about state. Offering it with nothing linked —
+          // which is exactly what a failed first run leaves behind — tells the
+          // person something was connected when nothing was.
+          label: slots.length > 0 ? "Connect more projects" : "Connect a project",
+        },
         {
           value: "tier",
           label: "Change what a project shares",

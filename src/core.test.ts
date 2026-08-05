@@ -94,6 +94,22 @@ test("onboarding never auto-selects another owner's repository", () => {
   assert.deepEqual(recommendedRepos([client], "octocat", null), []);
 });
 
+test("standing inside another owner's repo preselects nothing in the chooser", () => {
+  /* The manual chooser preselects whatever this returns. It used to default to
+     the current directory instead, so refusing to auto-connect an employer's
+     repo still handed the chooser that repo pre-ticked — one Enter away from
+     the thing the refusal existed to prevent. */
+  const client = {
+    root: "/code/client",
+    label: "client",
+    owner: "acme",
+    remote: "https://github.com/acme/client",
+    linked: null,
+    worktrees: ["/code/client"],
+  };
+  assert.deepEqual(recommendedRepos([client], "octocat", client.root), []);
+});
+
 /* ------- project settings ------- */
 
 test("settings are written to settings.local.json, never settings.json", () => {
@@ -406,6 +422,31 @@ test("a cross-origin redirect is reported, not silently followed", async () => {
   }
 });
 
+test("an expired sign-in names the command that fixes it", async () => {
+  /* The server answers 401 with "invalid token". That is accurate and
+     unusable: it names the broken noun, not the next action, and a stored
+     credential expires for ordinary reasons. Whatever the server calls it,
+     the person at the terminal must be told to run `vibecom login`. */
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: "invalid token" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => sendScanned("https://example.com", "stale", []),
+      (error: Error) => {
+        assert.match(error.message, /vibecom login/);
+        assert.doesNotMatch(error.message, /^invalid token$/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("a same-origin redirect is still refused rather than looped", async () => {
   const original = globalThis.fetch;
   globalThis.fetch = (async () =>
@@ -547,4 +588,16 @@ test("without yielding, nothing can paint", async () => {
   }
   clearInterval(timer);
   assert.equal(ticks, 0, "this documents why the spinner never moved");
+});
+
+test("http is allowed for loopback only, so local testing needs no fake TLS", () => {
+  /* Requiring HTTPS everywhere left one way to exercise the CLI against a dev
+     server: a self-signed certificate plus NODE_TLS_REJECT_UNAUTHORIZED=0.
+     That habit is worse than the plaintext it avoids, and loopback has no
+     transport to intercept. Anything routable is still refused. */
+  assert.equal(secureOrigin("http://localhost:3000"), "http://localhost:3000");
+  assert.equal(secureOrigin("http://127.0.0.1:3000"), "http://127.0.0.1:3000");
+  assert.throws(() => secureOrigin("http://vibecom.build"), /HTTPS/);
+  assert.throws(() => secureOrigin("http://localhost.evil.com"), /HTTPS/);
+  assert.throws(() => secureOrigin("http://user:pass@localhost:3000"), /userinfo/);
 });
