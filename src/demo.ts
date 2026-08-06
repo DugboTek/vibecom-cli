@@ -82,7 +82,7 @@ export async function runDemo(): Promise<void> {
   await beat(800);
 
   console.log(`${pc.dim("│")}`);
-  console.log(`${pc.green("◆")}  Track my token usage everywhere?`);
+  console.log(`${pc.green("◆")}  Count tokens from every project on this machine?`);
   console.log(`${pc.dim("│")}  ${pc.green("●")} Yes ${pc.dim("/ ○ No")}`);
   await beat(1000);
 

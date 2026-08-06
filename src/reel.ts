@@ -245,7 +245,7 @@ const FRAMES: Frame[] = [
       "    |   .----------------------------------------.  |           ",
       "    |   |   building ...                         |  |           ",
       "    |   |   ############################  98%    |  |           ",
-      "    |   |   tests 329 passed                     |  |           ",
+      "    |   |   no errors                            |  |           ",
       "    |   |                                        |  |           ",
       "    |   '----------------------------------------'  |           ",
       "     \\____________________________________________/             ",
@@ -281,7 +281,7 @@ const FRAMES: Frame[] = [
       "    |   |   built. shipped.                      |  |           ",
       "    |   |   ############################ 100%    |  |           ",
       "    |   |                                        |  |           ",
-      "    |   |   + 6,300,000 tokens counted           |  |           ",
+      "    |   |   + {TOKENS}                           |  |           ",
       "    |   '----------------------------------------'  |           ",
       "     \\____________________________________________/             ",
       "              \\__________________________/                      ",
@@ -322,15 +322,46 @@ function personalise(caption: string, name?: string): string {
   return caption.replace(/NAME/g, name ?? "somebody");
 }
 
+/**
+ * Put the reader's own number on the screen, or no number at all.
+ *
+ * The closing frame used to read "+ 6,300,000 tokens counted" as fixed art —
+ * somebody else's lifetime total, shown to everybody. Somebody with 180K real
+ * tokens watched a fabricated 6.3M scroll past and then got handed their
+ * actual figure a moment later by the rank card, which made the first number
+ * the product ever showed them a made-up one. A count we do not have yet is
+ * not a smaller number, it is no number.
+ */
+function fillTokens(line: string, tokens?: number): string {
+  const start = line.indexOf("{TOKENS}");
+  if (start === -1) return line;
+  /* The frame repaints in place over a fixed number of lines, so the
+     substitution has to leave the row exactly as wide as it was. Write into
+     the span between the placeholder and the panel's closing border, and pad
+     to fill it rather than letting a shorter number shift the border left. */
+  const end = line.indexOf("|", start);
+  const span = (end === -1 ? line.length : end) - start;
+  const text =
+    tokens === undefined
+      ? "counting your tokens ..."
+      : `${tokens.toLocaleString("en-US")} tokens counted`;
+  return (
+    line.slice(0, start) + text.slice(0, span).padEnd(span) + line.slice(start + span)
+  );
+}
+
 function render(
   frame: Frame,
   index: number,
   shift: number,
-  name?: string
+  name?: string,
+  tokens?: number
 ): string {
   const lines = [
     pc.dim(PERF),
-    ...frame.art.map((line, row) => gradient(line, shift + row * 0.03)),
+    ...frame.art.map((line, row) =>
+      gradient(fillTokens(line, tokens), shift + row * 0.03)
+    ),
     pc.dim(PERF),
     /* Padded to a fixed width because the strip repaints in place: a shorter
        caption drawn over a longer one leaves the tail of the longer one on
@@ -350,15 +381,20 @@ const LINES = HEIGHT + 3;
  * cannot animate, so piped output and CI logs still get the picture without a
  * hundred repainted copies of it.
  */
-export async function playReel(name?: string): Promise<void> {
+export async function playReel(
+  name?: string,
+  tokens?: () => number | undefined
+): Promise<void> {
   if (!canAnimate) {
-    console.log(render(FRAMES[FRAMES.length - 1], FRAMES.length - 1, 0, name));
+    console.log(
+      render(FRAMES[FRAMES.length - 1], FRAMES.length - 1, 0, name, tokens?.())
+    );
     return;
   }
   process.stdout.write("\x1b[?25l"); // hide the cursor while it repaints
   try {
     for (let i = 0; i < FRAMES.length; i++) {
-      const body = render(FRAMES[i], i, i * 0.08, name);
+      const body = render(FRAMES[i], i, i * 0.08, name, tokens?.());
       process.stdout.write(i === 0 ? body + "\n" : `\x1b[${LINES}A` + body + "\n");
       await sleep(i === FRAMES.length - 1 ? 700 : 420);
     }
@@ -368,6 +404,8 @@ export async function playReel(name?: string): Promise<void> {
 }
 
 /** Every frame, one after another — for screenshots and the README. */
-export function reelFrames(name?: string): string[] {
-  return FRAMES.map((frame, index) => render(frame, index, index * 0.08, name));
+export function reelFrames(name?: string, tokens?: number): string[] {
+  return FRAMES.map((frame, index) =>
+    render(frame, index, index * 0.08, name, tokens)
+  );
 }

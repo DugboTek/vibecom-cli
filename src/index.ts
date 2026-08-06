@@ -597,7 +597,7 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
 
   const proceed = orExit(
     await p.confirm({
-      message: "Track my token usage everywhere?",
+      message: "Count tokens from every project on this machine?",
       initialValue: true,
     })
   );
@@ -617,10 +617,15 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
   void searchDir;
 
   /* The reel covers the scan, which is real waiting — thousands of transcripts
-     off disk and a round trip per batch. Both run together, so the story costs
-     nothing and the wait stops feeling like one. */
-  const scanning = runScan();
-  await playReel(cred.username);
+     off disk and a round trip per batch — and the closing frame reports what
+     the scan actually found rather than a number chosen for the artwork. While
+     the count is still unknown the frame says so instead of inventing one. */
+  let counted: number | undefined;
+  const scanning = runScan().then((result) => {
+    counted = result.tokens;
+    return result;
+  });
+  await playReel(cred.username, () => counted);
   const scan = await pulse("importing your token history", scanning);
   for (const failure of scan.failed) p.log.warn(failure);
   if (scan.tokens > 0) {
