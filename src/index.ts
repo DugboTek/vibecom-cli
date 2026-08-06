@@ -27,6 +27,10 @@ import {
   discoverRepos,
   ensureExcluded,
   ensureGitignored,
+  linkRepo,
+  type LinkResult,
+  SCAN_VERSION,
+  invalidateGlobalScanMarks,
   listWorktrees,
   projectRoot,
   readProjectToken,
@@ -85,6 +89,8 @@ import {
   installSessionHook,
   markScanned,
   readAutopilot,
+  isSlotStale,
+  markSlotStale,
   removeSessionHook,
   runAutopilot,
   scanDue,
@@ -421,63 +427,32 @@ async function applyLinks(
   let count = 0;
   for (const repo of selected) {
     spin.start(`linking ${repo.label}`);
-    const salt = repo.linked?.salt ?? newSalt();
-    const projectId = projectIdFor(salt, repo.root);
-    const trees = listWorktrees(repo.root);
-    let added = false;
+    /* linkRepo owns the whole grant: ignore preflight, mint, write to every
+       checkout, roll the token back if any of it fails, and invalidate the
+       machine-wide scan marks so work already imported under "all projects"
+       gets re-attributed to this project. This used to be a second copy of
+       that sequence, which meant links made through the wizard silently
+       skipped the invalidation — the attribution they were created to fix
+       stayed frozen exactly where it was wrong. */
+    let result: LinkResult;
     try {
-      // Establish and verify ignore protection before the server creates a
-      // bearer token or any checkout receives it.
-      added = ensureGitignored(repo.root);
-      ensureExcluded(repo.root);
-      for (const tree of trees) prepareProjectSettings(tree);
+      result = await linkRepo(
+        origin,
+        cred.token,
+        { root: repo.root, label: repo.label, salt: repo.linked?.salt },
+        tier
+      );
     } catch (error) {
       spin.stop(
         bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
       );
       continue;
     }
-    let token: string;
-    try {
-      token = (
-        await mintProjectToken(origin, cred.token, {
-          projectId,
-          projectLabel: repo.label,
-          tier,
-        })
-      ).access_token;
-    } catch (e) {
-      spin.stop(bad(`${repo.label}: ${e instanceof Error ? e.message : e}`));
-      continue;
-    }
-    /* Every checkout gets the config, not just the one we are standing in.
-       A worktree starts with no .claude/settings.local.json — the file is
-       gitignored, so `git worktree add` never copies it — and agent tools do
-       all their work in worktrees. Covering only the main checkout would mean
-       tracking almost nothing, silently. */
-    try {
-      for (const tree of trees) writeProjectSettings(tree, origin, token);
-    } catch (error) {
-      await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
-      spin.stop(
-        bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
-      );
-      continue;
-    }
-    writeSlot({
-      root: repo.root,
-      salt,
-      projectId,
-      tier,
-      label: repo.label,
-      origin,
-      linkedAt: new Date().toISOString(),
-    });
-    const extra = trees.length - 1;
+    const extra = result.worktrees.length - 1;
     spin.stop(
-      `${pc.bold(repo.label)} ${pc.dim("→")} ${projectId.slice(0, 12)}…` +
+      `${pc.bold(repo.label)} ${pc.dim("→")} ${result.slot.projectId.slice(0, 12)}…` +
         (extra > 0 ? pc.dim(`  +${extra} worktree${extra === 1 ? "" : "s"}`) : "") +
-        (added ? pc.dim("  (+.gitignore)") : "")
+        (result.gitignoreAdded ? pc.dim("  (+.gitignore)") : "")
     );
     count++;
   }
@@ -847,7 +822,7 @@ async function runScan(
       !full &&
       mark &&
       mark.activityVersion === 1 &&
-      mark.scanVersion === 2 &&
+      mark.scanVersion === SCAN_VERSION &&
       mark.file === usage.file &&
       mark.lines === usage.lines &&
       mark.mtimeMs === usage.mtimeMs
@@ -920,6 +895,14 @@ async function runScan(
         ? readGlobalToken()
         : readProjectToken(slot.root);
     if (!token) continue;
+    /* A slot the server has revoked is consent withdrawn, not a broken file.
+       Re-sending would keep asking a door that has been closed, and falling
+       back to the machine-wide slot would route this project's work somewhere
+       the person did not agree to. Skip it and say so. */
+    if (isSlotStale(slot.root)) {
+      failed.add(`${slot.label}: access was revoked — run vibecom doctor`);
+      continue;
+    }
     for (let i = 0; i < list.length; i += 50) {
       const batch = list.slice(i, i + 50);
       try {
@@ -947,6 +930,13 @@ async function runScan(
         sessions += batch.length;
         for (const b of batch) marks[b.key] = markFor(b.usage, slot.root);
       } catch (e) {
+        /* 401/403 is the server saying this credential is no longer valid.
+           Recording it stops the next scan re-trying a revoked token, and
+           stops autopilot quietly minting a replacement for consent that was
+           deliberately withdrawn. */
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          markSlotStale(slot.root);
+        }
         // one line per project, not per batch
         failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
       }
@@ -1064,6 +1054,9 @@ async function sendGitStats(
       await sendRepoStats(slot.origin, token, [stats]);
       sent += 1;
     } catch (e) {
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+        markSlotStale(slot.root);
+      }
       failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
     }
   }
@@ -1086,7 +1079,7 @@ function markFor(u: SessionUsage, root: string, model?: string | null) {
     root,
     model: u.model ?? model ?? null,
     activityVersion: 1 as const,
-    scanVersion: 2 as const,
+    scanVersion: SCAN_VERSION,
   };
 }
 
