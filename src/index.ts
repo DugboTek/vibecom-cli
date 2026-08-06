@@ -625,7 +625,10 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
     counted = result.tokens;
     return result;
   });
-  await playReel(cred.username, () => counted);
+  /* The flipbook loops until the scan resolves rather than running a fixed
+     length and then handing over to a spinner, so the wait is the animation
+     instead of being followed by one. */
+  await playReel(cred.username, () => counted, scanning);
   const scan = await pulse("importing your token history", scanning);
   for (const failure of scan.failed) p.log.warn(failure);
   if (scan.tokens > 0) {

@@ -22,13 +22,14 @@ test("the reel never states a token count it was not given", () => {
     [],
     `the reel invented these figures: ${numbers.join(", ")}`
   );
-  assert.match(frames, /counting your tokens/);
+  /* With no count yet the page shows the story beat and no figure at all,
+     rather than a placeholder number standing in for one. */
+  assert.match(frames, /sits down/);
 });
 
 test("given a real total, the reel shows that total", () => {
   const frames = reelFrames("builder", 412_000).map(strip).join("\n");
-  assert.match(frames, /412,000 tokens counted/);
-  assert.doesNotMatch(frames, /counting your tokens/);
+  assert.match(frames, /412,000 tokens/);
 });
 
 test("substituting the count does not change the frame geometry", () => {
@@ -53,4 +54,15 @@ test("no frame claims something happened on the reader's machine", () => {
   /* "tests 329 passed" was a claim about a test run the CLI never performed. */
   const frames = reelFrames("builder").map(strip).join("\n");
   assert.doesNotMatch(frames, /tests \d+ passed/);
+});
+
+test("every page is the same size, so the flipbook cannot drift", () => {
+  /* The pages repaint on top of each other. One page a row taller or a column
+     wider than its neighbours walks the drawing across the screen instead of
+     animating it in place. */
+  const pages = reelFrames("builder").map(strip).map((p) => p.split("\n"));
+  const heights = new Set(pages.map((p) => p.length));
+  assert.equal(heights.size, 1, `pages differ in height: ${[...heights]}`);
+  const widths = new Set(pages.flat().map((l) => l.length));
+  assert.equal(widths.size, 1, `pages differ in width: ${[...widths]}`);
 });
