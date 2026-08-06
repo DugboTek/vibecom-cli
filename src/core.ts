@@ -731,6 +731,91 @@ export function writeProjectSettings(
   return file;
 }
 
+/* ------- global (whole-machine) tracking ------- */
+
+/** Claude Code's user-level settings: applies to every project, everywhere. */
+export const GLOBAL_SETTINGS_FILE = path.join(
+  os.homedir(),
+  ".claude",
+  "settings.json"
+);
+
+/** The marker slot that records the machine is tracked as a whole. */
+export const GLOBAL_SLOT_ROOT = "*";
+
+/**
+ * Turn on tracking for every project on this machine at once.
+ *
+ * Per-repository linking asks a person to remember an administrative step at
+ * the exact moment they are trying to start work, in a directory they have
+ * usually just created. The step is invisible when skipped: nothing appears,
+ * nothing warns, and the sessions are simply gone. Writing the exporter into
+ * Claude Code's user-level settings covers whatever you open next, including
+ * worktrees, without another decision.
+ *
+ * The trade is real and belongs to whoever runs this: one token now sees every
+ * repository on the machine, employer and client code included. `vibecom
+ * exclude` carves individual projects back out, and the tier still governs
+ * what any of it may report.
+ */
+export function writeGlobalSettings(origin: string, token: string): string {
+  origin = secureOrigin(origin);
+  fs.mkdirSync(path.dirname(GLOBAL_SETTINGS_FILE), {
+    recursive: true,
+    mode: 0o700,
+  });
+  const data = readJson<Record<string, unknown>>(GLOBAL_SETTINGS_FILE, {});
+  const env = (
+    typeof data.env === "object" && data.env !== null ? data.env : {}
+  ) as Record<string, string>;
+  Object.assign(env, {
+    CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+    OTEL_METRICS_EXPORTER: "otlp",
+    OTEL_LOGS_EXPORTER: "otlp",
+    OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
+    OTEL_EXPORTER_OTLP_ENDPOINT: `${origin}/api`,
+    OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${token}`,
+    // Explicit: prompt bodies are never exported, at any tier.
+    OTEL_LOG_USER_PROMPTS: "0",
+  });
+  data.env = env;
+  /* This file is not inside any repository, so the gitignore preflight that
+     guards per-project writes does not apply — but it still carries a bearer
+     token, so it still gets 0600. */
+  writePrivateFile(GLOBAL_SETTINGS_FILE, JSON.stringify(data, null, 2) + "\n");
+  return GLOBAL_SETTINGS_FILE;
+}
+
+/** Whether whole-machine tracking is currently configured. */
+export function globalTrackingOn(): boolean {
+  const data = readJson<{ env?: Record<string, string> }>(
+    GLOBAL_SETTINGS_FILE,
+    {}
+  );
+  return Boolean(data.env?.OTEL_EXPORTER_OTLP_HEADERS);
+}
+
+/** Remove whole-machine tracking, leaving any unrelated settings intact. */
+export function removeGlobalSettings(): boolean {
+  const data = readJson<Record<string, unknown>>(GLOBAL_SETTINGS_FILE, {});
+  const env = (
+    typeof data.env === "object" && data.env !== null ? data.env : null
+  ) as Record<string, string> | null;
+  if (!env) return false;
+  let removed = false;
+  for (const key of OTEL_KEYS) {
+    if (key in env) {
+      delete env[key];
+      removed = true;
+    }
+  }
+  if (!removed) return false;
+  if (Object.keys(env).length === 0) delete data.env;
+  else data.env = env;
+  writePrivateFile(GLOBAL_SETTINGS_FILE, JSON.stringify(data, null, 2) + "\n");
+  return true;
+}
+
 /** Establish and verify ignore/tracking invariants before a token is minted. */
 export function prepareProjectSettings(root: string): string {
   const canonicalRoot = realpath(root);

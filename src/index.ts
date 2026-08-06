@@ -3,6 +3,16 @@ import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import {
+  RANKS,
+  bar,
+  compact,
+  nextRank,
+  progressTo,
+  rankFor,
+  sparkline,
+  streakFrom,
+} from "./rank";
+import {
   ApiError,
   BUILD,
   VERSION,
@@ -20,6 +30,11 @@ import {
   listWorktrees,
   projectRoot,
   readProjectToken,
+  GLOBAL_SETTINGS_FILE,
+  GLOBAL_SLOT_ROOT,
+  globalTrackingOn,
+  removeGlobalSettings,
+  writeGlobalSettings,
   recommendedRepos,
   readScanMarks,
   sendRepoStats,
@@ -443,62 +458,100 @@ async function runLink(cred: Credentials, searchDir: string): Promise<number> {
   return count;
 }
 
-/** First-run path: one understandable choice, with conservative defaults. */
+/**
+ * Track every project on this machine, now and in future, with one decision.
+ *
+ * Per-repository linking put an administrative step between a person and the
+ * work they sat down to do, in a directory they had usually just created — and
+ * skipping it was silent. No warning, no empty state, just months of sessions
+ * that were never counted. Whole-machine tracking is the behaviour people
+ * already assume they are getting.
+ */
+async function linkGlobal(cred: Credentials, origin: string): Promise<boolean> {
+  const existing = readSlot(GLOBAL_SLOT_ROOT);
+  const salt = existing?.salt ?? newSalt();
+  const projectId = projectIdFor(salt, GLOBAL_SLOT_ROOT);
+  const spin = p.spinner();
+  spin.start("turning on tracking for this machine");
+  let token: string;
+  try {
+    token = (
+      await mintProjectToken(origin, cred.token, {
+        projectId,
+        projectLabel: "all projects",
+        tier: 1,
+      })
+    ).access_token;
+  } catch (error) {
+    spin.stop(bad(error instanceof Error ? error.message : String(error)));
+    return false;
+  }
+  try {
+    writeGlobalSettings(origin, token);
+  } catch (error) {
+    await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
+    spin.stop(bad(error instanceof Error ? error.message : String(error)));
+    return false;
+  }
+  writeSlot({
+    root: GLOBAL_SLOT_ROOT,
+    salt,
+    projectId,
+    tier: 1,
+    label: "everything on this machine",
+    origin,
+    linkedAt: new Date().toISOString(),
+  });
+  spin.stop(`${pc.green("✔")} tracking every project on this machine`);
+  return true;
+}
+
+/**
+ * First run: turn on tracking for the whole machine, in one keystroke.
+ *
+ * The old flow discovered repositories, proposed a subset, and connected those
+ * — which meant every project created afterwards was silently uncounted until
+ * somebody remembered to come back and link it. Nobody remembers. Default to
+ * the machine and let people carve pieces back out.
+ */
 async function quickStart(cred: Credentials, searchDir: string): Promise<number> {
   const origin = cred.origin || resolveOrigin();
-  const repos = await pulse(
-    "finding your projects and coding tools",
-    Promise.resolve(discoverRepos(searchDir))
+  const tools = await pulse(
+    "looking for your coding tools",
+    Promise.resolve(
+      transcriptSources()
+        .filter((source) => source.files.length > 0)
+        .map((source) =>
+          source.tool === "claude-code"
+            ? "Claude Code"
+            : source.tool === "codex"
+              ? "Codex"
+              : "Kimi"
+        )
+    )
   );
-  const selected = recommendedRepos(repos, cred.username, projectRoot());
-  if (selected.length === 0) {
-    /* Naming only what the tool failed to do leaves the person to guess
-       whether something is broken. The cause is almost always benign — the
-       repos here belong to an employer or org — and the next screen is a
-       normal chooser, so say both before it appears. */
-    p.log.info(
-      repos.length === 0
-        ? `No git projects under ${searchDir} yet — pick one yourself below.`
-        : "None of these projects are clearly yours, so I won't guess — " +
-            "employer and client code stays unconnected unless you say so."
-    );
-    return runLink(cred, searchDir);
-  }
 
-  const tools = transcriptSources()
-    .filter((source) => source.files.length > 0)
-    .map((source) =>
-      source.tool === "claude-code"
-        ? "Claude Code"
-        : source.tool === "codex"
-          ? "Codex"
-          : "Kimi"
-    );
   p.note(
     [
-      `${pc.bold("Projects")}  ${selected.map((repo) => repo.label).join(", ")}`,
-      /* Claiming "supported session files" when the scan found none states a
-         discovery that did not happen, and the first screen is where a
-         beginner builds their model of what this tool can see. Say the true
-         thing — nothing yet — and say what makes it change. */
+      `${pc.bold("Tracking")}  every project on this computer`,
       `${pc.bold("Found")}     ${
         tools.length > 0
           ? tools.join(" + ")
           : "no past sessions yet — new ones will be counted"
       }`,
       "",
-      "Vibecom will import token counters and build activity already on",
-      "this computer, then keep these projects up to date.",
+      "New projects count automatically — no setup per repository,",
+      "and worktrees are covered too.",
       "",
       pc.dim("Activity totals only. Never your code or prompts."),
-      pc.dim("You can change this anytime with vibecom."),
+      pc.dim("Exclude any project later with vibecom."),
     ].join("\n"),
     "ready to connect"
   );
 
   const proceed = orExit(
     await p.confirm({
-      message: "Connect and import my activity?",
+      message: "Track my coding activity everywhere?",
       initialValue: true,
     })
   );
@@ -507,21 +560,24 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
     return 0;
   }
 
-  if (!(await reviewOwnership(selected, cred, origin))) return 0;
-  const count = await applyLinks(cred, origin, selected, 1);
-  /* applyLinks prints why each project failed, then this function used to
-     return quietly into the menu. A red line followed by a normal menu reads
-     as "that worked, what's next". State the outcome. */
-  if (count === 0) {
+  if (!(await linkGlobal(cred, origin))) {
     p.log.warn(
       "Nothing was connected, and nothing is being collected. " +
-        "Fix the problem above, then choose Connect a project."
+        "Fix the problem above, then run vibecom again."
     );
     return 0;
   }
+  const count = 1;
+  void searchDir;
 
   const scan = await pulse("importing your existing activity", runScan());
   for (const failure of scan.failed) p.log.warn(failure);
+  if (scan.tokens > 0) {
+    p.note(
+      rankCard(scan.tokens, scan.days, `${origin}/u/${cred.username}`),
+      pc.bold(gradient("  your rank  "))
+    );
+  }
   p.note(
     [
       scan.sessions > 0
@@ -595,6 +651,11 @@ async function runScan(
   byTool: Record<string, number>;
   failed: string[];
   repos: number;
+  /* Totals for the rank card. The scan already walks every session; deriving
+     these here costs nothing and avoids a second pass or a server round-trip
+     just to tell somebody what they earned. */
+  tokens: number;
+  days: string[];
 }> {
   const slots = listSlots();
   if (slots.length === 0)
@@ -605,9 +666,13 @@ async function runScan(
       byTool: {},
       failed: [],
       repos: 0,
+      tokens: 0,
+      days: [],
     };
 
   const marks = readScanMarks();
+  let tokens = 0;
+  const days = new Set<string>();
   const kimiDirs = kimiWorkdirs();
 
   const allFiles = transcriptSources().flatMap((source) =>
@@ -703,6 +768,14 @@ async function runScan(
       { usage, key },
     ]);
     byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
+    tokens +=
+      usage.inputTokens +
+      usage.outputTokens +
+      usage.cacheReadTokens +
+      usage.cacheCreationTokens;
+    for (const bucket of usage.activity) {
+      days.add(new Date(bucket.bucketAtMs).toISOString().slice(0, 10));
+    }
   }
 
   let sent = 0;
@@ -754,7 +827,16 @@ async function runScan(
      activity would leave the counters permanently stale. */
   const repos = await sendGitStats(slots, failed);
 
-  return { sent, sessions, skipped, byTool, failed: [...failed], repos };
+  return {
+    sent,
+    sessions,
+    skipped,
+    byTool,
+    failed: [...failed],
+    repos,
+    tokens,
+    days: [...days].sort(),
+  };
 }
 
 /**
@@ -968,6 +1050,52 @@ async function menu(cred: Credentials): Promise<boolean> {
 }
 
 /**
+ * The reward screen: rank, distance to the next one, and the streak.
+ *
+ * All of this already existed on the server and none of it reached the
+ * terminal, which is where people are sitting while the numbers move. A flat
+ * "connected" gives no reason to run the command twice. Showing the ladder,
+ * how far along the current rung you are, and what the next one is called
+ * turns the same data into a reason to come back — the progress is real, so
+ * the only thing that was missing was saying it out loud.
+ *
+ * Named ranks stay unabbreviated: "Senior Vibe Engineer" is the payoff, and
+ * truncating it to fit a box would be throwing away the reward to save eight
+ * columns.
+ */
+function rankCard(tokens: number, days: readonly string[], profile: string) {
+  const rank = rankFor(tokens);
+  const next = nextRank(rank);
+  const fraction = progressTo(tokens, rank);
+  const streak = streakFrom(days, new Date());
+  const recent = days.slice(-14);
+  const perDay = recent.map(() => 1);
+
+  const lines = [
+    `${gradient("  ▲  ")} ${pc.bold(rank.name)}  ${pc.dim(`lv ${rank.level}/${RANKS.length}`)}`,
+    "",
+    `  ${gradient(bar(fraction))}  ${pc.bold(`${Math.round(fraction * 100)}%`)}`,
+    next
+      ? `  ${pc.dim(`${compact(Math.max(0, next.minTokens - tokens))} tokens to `)}${pc.bold(next.short)}`
+      : `  ${pc.green("top of the ladder — nothing left to climb")}`,
+    "",
+    `  ${pc.bold(compact(tokens))} ${pc.dim("tokens")}   ${pc.bold(
+      String(days.length)
+    )} ${pc.dim("active day" + (days.length === 1 ? "" : "s"))}`,
+  ];
+
+  if (streak > 0) {
+    lines.push(
+      `  ${pc.yellow("🔥")} ${pc.bold(`${streak} day streak`)}${
+        recent.length > 1 ? `  ${pc.dim(sparkline(perDay))}` : ""
+      }`
+    );
+  }
+  lines.push("", pc.dim(`  ${profile}`));
+  return lines.join("\n");
+}
+
+/**
  * Say what is true right now, before offering anything to change.
  *
  * Answers the three questions a person arrives at this screen holding: am I
@@ -1007,10 +1135,16 @@ function showState(cred: Credentials) {
   p.note(
     [
       `${pc.green("✔")} Signed in as ${pc.bold(cred.username)}`,
-      `${pc.green("✔")} Collecting from ${pc.bold(
-        `${slots.length} project${slots.length === 1 ? "" : "s"}`
-      )}${worktrees > 0 ? pc.dim(`  +${worktrees} worktree${worktrees === 1 ? "" : "s"}`) : ""}`,
-      ...slots.map((slot) => `    ${pc.dim("·")} ${slot.label}`),
+      globalTrackingOn()
+        ? `${pc.green("✔")} Collecting from ${pc.bold(
+            "every project on this computer"
+          )}${pc.dim(" — new ones count automatically")}`
+        : `${pc.green("✔")} Collecting from ${pc.bold(
+            `${slots.length} project${slots.length === 1 ? "" : "s"}`
+          )}${worktrees > 0 ? pc.dim(`  +${worktrees} worktree${worktrees === 1 ? "" : "s"}`) : ""}`,
+      ...(globalTrackingOn()
+        ? []
+        : slots.map((slot) => `    ${pc.dim("·")} ${slot.label}`)),
       tools.length > 0
         ? `${pc.green("✔")} Reading ${pc.bold(tools.join(" + "))}`
         : `${pc.yellow("○")} No coding sessions found yet — new ones will count`,
@@ -1116,19 +1250,34 @@ async function doUnlink(cred: Credentials, slot: ProjectSlot) {
       return { ok: false };
     })
   );
-  // strip every checkout, or a stale worktree keeps a now-revoked token on disk
-  const trees = listWorktrees(slot.root);
-  for (const tree of trees) removeProjectSettings(tree);
+  let checkouts = 0;
+  if (slot.root === GLOBAL_SLOT_ROOT) {
+    /* Nothing on disk belongs to a repository here — the exporter lives in
+       Claude Code's user-level settings, so leaving it behind would keep
+       pointing every project at a token that was just revoked. */
+    removeGlobalSettings();
+  } else {
+    // strip every checkout, or a stale worktree keeps a now-revoked token on disk
+    const trees = listWorktrees(slot.root);
+    for (const tree of trees) removeProjectSettings(tree);
+    checkouts = trees.length;
+  }
   deleteSlot(slot.root);
   p.log.success(
-    `unlinked ${slot.label}${trees.length > 1 ? pc.dim(` (${trees.length} checkouts)`) : ""}`
+    `unlinked ${slot.label}${checkouts > 1 ? pc.dim(` (${checkouts} checkouts)`) : ""}`
   );
   p.note(
     [
       "Token revoked server-side and the local salt deleted, so this",
       "project's past rows can never be re-associated with a new link.",
       "",
-      pc.dim(`cleaned ${settingsPathFor(slot.root)}`),
+      pc.dim(
+        `cleaned ${
+          slot.root === GLOBAL_SLOT_ROOT
+            ? GLOBAL_SETTINGS_FILE
+            : settingsPathFor(slot.root)
+        }`
+      ),
     ].join("\n"),
     "done"
   );
