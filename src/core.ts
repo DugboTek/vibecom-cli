@@ -42,7 +42,7 @@ function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
-function readJson<T>(file: string, fallback: T): T {
+export function readJson<T>(file: string, fallback: T): T {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8")) as T;
   } catch {
@@ -50,7 +50,7 @@ function readJson<T>(file: string, fallback: T): T {
   }
 }
 
-function writeJson(file: string, value: unknown) {
+export function writeJson(file: string, value: unknown) {
   ensureDir(path.dirname(file));
   writePrivateFile(file, JSON.stringify(value, null, 2) + "\n");
 }
@@ -1314,4 +1314,140 @@ export async function selfUpdate(
     from: VERSION,
     kind: here && there ? bumpKind(here, there) : "unknown",
   };
+}
+
+/* ------- linking ------- */
+
+export type LinkResult = {
+  slot: ProjectSlot;
+  /** every checkout that received the config, main worktree first */
+  worktrees: string[];
+  gitignoreAdded: boolean;
+};
+
+/**
+ * Mint one project's token and write it into every checkout of that project.
+ *
+ * Shared by the interactive wizard and the session hook so a link established
+ * without a prompt is byte-for-byte the same grant as one established with
+ * one — same ignore preflight, same worktree coverage, same rollback. Two
+ * copies of this sequence would eventually disagree about which protection is
+ * mandatory, and the unattended path is the worse one to get wrong.
+ */
+export async function linkRepo(
+  origin: string,
+  accountToken: string,
+  repo: { root: string; label: string; salt?: string },
+  tier: 1 | 2 | 3
+): Promise<LinkResult> {
+  const salt = repo.salt ?? newSalt();
+  const projectId = projectIdFor(salt, repo.root);
+  const worktrees = listWorktrees(repo.root);
+
+  // Establish and verify ignore protection before the server creates a bearer
+  // token or any checkout receives it.
+  const gitignoreAdded = ensureGitignored(repo.root);
+  ensureExcluded(repo.root);
+  for (const tree of worktrees) prepareProjectSettings(tree);
+
+  const minted = await mintProjectToken(origin, accountToken, {
+    projectId,
+    projectLabel: repo.label,
+    tier,
+  });
+
+  try {
+    for (const tree of worktrees) {
+      writeProjectSettings(tree, origin, minted.access_token);
+    }
+  } catch (error) {
+    /* A token that reached no checkout is a grant nobody asked for. Hand it
+       back rather than leave it live on the server. */
+    await revokeProjectToken(origin, accountToken, projectId).catch(
+      () => undefined
+    );
+    throw error;
+  }
+
+  const slot: ProjectSlot = {
+    root: repo.root,
+    salt,
+    projectId,
+    tier,
+    label: repo.label,
+    origin,
+    linkedAt: new Date().toISOString(),
+  };
+  writeSlot(slot);
+  return { slot, worktrees, gitignoreAdded };
+}
+
+/* ------- codex whole-machine config ------- */
+
+export const CODEX_CONFIG_FILE = path.join(os.homedir(), ".codex", "config.toml");
+
+/**
+ * Point Codex's OTLP exporter at the same place, with the same token.
+ *
+ * Codex keeps its exporter in its own config file, so the machine-wide token
+ * ends up written in two places. Nothing kept them in step: re-minting that
+ * token — which `vibecom login` does on any origin change — rewrote Claude
+ * Code's settings and left Codex holding a credential the server had already
+ * revoked. Codex went on exporting to a 401 and looked configured the whole
+ * time, which is the same silent failure as pointing at a host that no longer
+ * resolves. Written from the one place the token is issued, so the two cannot
+ * drift again.
+ *
+ * Best-effort by design: Codex may not be installed, and a machine without it
+ * is not a broken setup.
+ */
+export function writeCodexSettings(origin: string, token: string): boolean {
+  origin = secureOrigin(origin);
+  if (!fs.existsSync(CODEX_CONFIG_FILE)) return false;
+  let body: string;
+  try {
+    body = fs.readFileSync(CODEX_CONFIG_FILE, "utf8");
+  } catch {
+    return false;
+  }
+  const exporter =
+    `exporter = { otlp-http = { endpoint = "${origin}/api/v1/logs", ` +
+    `protocol = "json", headers = { "Authorization" = "Bearer ${token}" } } }`;
+
+  let next: string;
+  if (/^\[otel\]/m.test(body)) {
+    next = /^exporter = \{ otlp-http = .*$/m.test(body)
+      ? body.replace(/^exporter = \{ otlp-http = .*$/m, exporter)
+      : body.replace(/^\[otel\]$/m, "[otel]\n" + exporter);
+  } else {
+    next = body.replace(/\n*$/, "") + "\n\n[otel]\n" + exporter + "\n";
+  }
+  if (next === body) return false;
+  try {
+    /* Not writePrivateFile: this is the user's own config, and tightening its
+       mode as a side effect of adding a token is not ours to decide. */
+    fs.writeFileSync(CODEX_CONFIG_FILE, next);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Drop our exporter block, leaving the rest of Codex's config alone. */
+export function removeCodexSettings(): boolean {
+  if (!fs.existsSync(CODEX_CONFIG_FILE)) return false;
+  let body: string;
+  try {
+    body = fs.readFileSync(CODEX_CONFIG_FILE, "utf8");
+  } catch {
+    return false;
+  }
+  const next = body.replace(/\n?\[otel\]\nexporter = \{ otlp-http = .*\n/m, "\n");
+  if (next === body) return false;
+  try {
+    fs.writeFileSync(CODEX_CONFIG_FILE, next);
+    return true;
+  } catch {
+    return false;
+  }
 }

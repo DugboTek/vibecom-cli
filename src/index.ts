@@ -37,6 +37,8 @@ import {
   globalTrackingOn,
   removeGlobalSettings,
   writeGlobalSettings,
+  writeCodexSettings,
+  removeCodexSettings,
   recommendedRepos,
   readScanMarks,
   sendRepoStats,
@@ -75,6 +77,22 @@ import {
   type SessionUsage,
 } from "./transcripts";
 import { aggregateUncoveredRepos, collectRepoStats } from "./gitStats";
+import {
+  DEFAULT_AUTOPILOT,
+  type AutopilotConfig,
+  claudeSettingsPath,
+  describeAction,
+  installSessionHook,
+  markScanned,
+  readAutopilot,
+  removeSessionHook,
+  runAutopilot,
+  scanDue,
+  sessionHookInstalled,
+  uncoveredEverywhere,
+  writeAutopilot,
+} from "./autopilot";
+import { spawn } from "node:child_process";
 import { playReel, reelFrames } from "./reel";
 import { runDemo } from "./demo";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
@@ -211,6 +229,7 @@ async function repairOriginDrift(cred: Credentials): Promise<void> {
       .catch(() => undefined);
     deleteSlot(GLOBAL_SLOT_ROOT);
     removeGlobalSettings();
+    removeCodexSettings();
     await linkGlobal(cred, cred.origin);
   }
 
@@ -574,6 +593,9 @@ async function linkGlobal(cred: Credentials, origin: string): Promise<boolean> {
   }
   try {
     writeGlobalSettings(origin, token);
+    /* Same token, same origin, written from the one place it is issued —
+       so a re-mint can never leave Codex holding a revoked credential. */
+    writeCodexSettings(origin, token);
   } catch (error) {
     await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
     spin.stop(bad(error instanceof Error ? error.message : String(error)));
@@ -1479,6 +1501,7 @@ async function doUnlink(cred: Credentials, slot: ProjectSlot) {
        Claude Code's user-level settings, so leaving it behind would keep
        pointing every project at a token that was just revoked. */
     removeGlobalSettings();
+    removeCodexSettings();
   } else {
     // strip every checkout, or a stale worktree keeps a now-revoked token on disk
     const trees = listWorktrees(slot.root);
@@ -1717,6 +1740,217 @@ async function help() {
   console.log();
 }
 
+/* ============================================================ autopilot === */
+
+/**
+ * Absolute path of the binary a hook should invoke.
+ *
+ * The installed bin carries its own shebang, so pointing at it survives a Node
+ * upgrade that would invalidate a hard-coded interpreter path. Running from a
+ * build directory resolves to the installed copy instead, so a hook does not
+ * break the moment that checkout moves.
+ */
+function hookBinary(): string {
+  const script = process.argv[1] ? path.resolve(process.argv[1]) : "";
+  const named = (file: string) =>
+    path.basename(file).replace(/\.[^.]+$/, "") === "vibecom";
+  if (script && named(script)) return script;
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "vibecom");
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+  return script || "vibecom";
+}
+
+/**
+ * The tier this builder has already chosen most often.
+ *
+ * An unattended link must not quietly collect more than the linked projects
+ * beside it, nor pointlessly less. Matching the prevailing choice is the only
+ * default that needs no explanation when the recap is read back.
+ */
+function prevailingTier(): 1 | 2 | 3 {
+  const counts = new Map<1 | 2 | 3, number>();
+  for (const slot of listSlots()) {
+    counts.set(slot.tier, (counts.get(slot.tier) ?? 0) + 1);
+  }
+  let best = DEFAULT_AUTOPILOT.tier;
+  let seen = 0;
+  for (const [tier, count] of counts) {
+    if (count > seen) {
+      best = tier;
+      seen = count;
+    }
+  }
+  return best;
+}
+
+function reportAutopilot(config: AutopilotConfig) {
+  const installed = sessionHookInstalled();
+  const live = config.enabled && installed;
+  console.log(bullet((live ? plus : minus)(`autopilot ${live ? "on" : "off"}`)));
+  if (config.enabled && !installed) {
+    p.log.warn(
+      `enabled, but no session hook in ${claudeSettingsPath()} — run ${pc.bold("vibecom autopilot on")}`
+    );
+  }
+  console.log(
+    bullet(
+      pc.dim(
+        `   new checkouts of a linked project  ${config.enabled ? "covered automatically" : "need vibecom sync"}`
+      )
+    )
+  );
+  console.log(
+    bullet(
+      pc.dim(
+        `   repos owned by you or a trusted owner  ${
+          config.enabled && config.autoLink
+            ? `linked automatically at ${tierSwatch(config.tier)} tier ${config.tier}`
+            : "need vibecom link"
+        }`
+      )
+    )
+  );
+  console.log(
+    bullet(
+      pc.dim(
+        `   Codex, Kimi and git counters  ${
+          config.enabled && config.scan
+            ? `scanned in the background, at most every ${config.scanIntervalMinutes}m`
+            : "need vibecom scan"
+        }`
+      )
+    )
+  );
+}
+
+async function autopilot(args: string[]): Promise<void> {
+  const sub = (args[0] ?? "").toLowerCase();
+  const config = readAutopilot();
+
+  if (sub === "off") {
+    writeAutopilot({ ...config, enabled: false });
+    const removed = removeSessionHook();
+    p.log.success(
+      removed ? "autopilot off — session hook removed" : "autopilot off"
+    );
+    p.log.info("linked projects keep reporting; nothing new is connected");
+    return;
+  }
+
+  if (sub === "on") {
+    const next: AutopilotConfig = {
+      ...config,
+      enabled: true,
+      tier: config.enabled ? config.tier : prevailingTier(),
+    };
+    const { backup } = installSessionHook(hookBinary());
+    writeAutopilot(next);
+    p.log.success(`autopilot on — tier ${next.tier}`);
+    if (backup) p.log.info(`settings backed up to ${backup}`);
+    reportAutopilot(next);
+    return;
+  }
+
+  if (sub === "status" || sub === "") {
+    p.intro(gradient("  autopilot  "));
+    reportAutopilot(config);
+    const gaps = uncoveredEverywhere(listSlots());
+    if (gaps.length > 0) {
+      console.log();
+      console.log(rule("checkouts not yet reporting"));
+      for (const gap of gaps) {
+        console.log(
+          bullet(
+            `${pc.bold(gap.label)} ${pc.dim(`— ${gap.missing.length} checkout${gap.missing.length === 1 ? "" : "s"}`)}`
+          )
+        );
+      }
+    }
+    p.outro(
+      pc.dim(
+        `${pc.bold("vibecom autopilot on")} to enable, ${pc.bold("off")} to stop`
+      )
+    );
+    return;
+  }
+
+  die("usage: vibecom autopilot [on|off|status]");
+}
+
+/* ================================================================= hook === */
+
+/** Read the hook payload without hanging when nothing is piped in. */
+function readHookInput(): { cwd?: string } {
+  if (process.stdin.isTTY) return {};
+  try {
+    return JSON.parse(fs.readFileSync(0, "utf8")) as { cwd?: string };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Start an incremental scan that outlives this hook.
+ *
+ * OTLP env vars are read once at process start, so the session that triggers a
+ * fresh link can never be made to export — its transcript on disk is the only
+ * record it ever leaves. Scanning here is what stops the first session in a new
+ * checkout from being the one session that is always lost. It is also the only
+ * path that carries Codex, Kimi and the git counters at all.
+ */
+function kickBackgroundScan(): void {
+  const script = process.argv[1];
+  if (!script) return;
+  markScanned();
+  const child = spawn(process.execPath, [path.resolve(script), "scan"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+/**
+ * `vibecom hook` — the SessionStart handler.
+ *
+ * Exits 0 whatever happens. A non-zero exit here paints an error over a screen
+ * the builder is trying to work on, and there is nothing this hook could fail
+ * at that is worth interrupting them for.
+ */
+async function sessionHook(): Promise<void> {
+  const config = readAutopilot();
+  let notice: string | null = null;
+  try {
+    const input = readHookInput();
+    notice = describeAction(
+      await runAutopilot(input.cwd ?? process.cwd(), {
+        credentials: readCredentials(),
+        config,
+      })
+    );
+  } catch {
+    /* Wiring up failed — the background scan below still recovers this
+       session's usage from its transcript, so stay quiet and carry on. */
+  }
+  try {
+    if (config.enabled && scanDue(config)) kickBackgroundScan();
+  } catch {
+    // a scan that could not start is not worth a word on screen
+  }
+  if (notice) {
+    process.stdout.write(
+      JSON.stringify({ systemMessage: notice, suppressOutput: true }) + "\n"
+    );
+  }
+}
+
 const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   login: async () => {
     await banner("the community for AI builders");
@@ -1834,6 +2068,10 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     }
     p.outro(pc.dim("covers sessions already running; no restart needed"));
   },
+  autopilot: async (args) => autopilot(args),
+  /* Machine-facing, so it is deliberately absent from `help`: Claude Code
+     invokes it with the SessionStart payload on stdin. */
+  hook: async () => sessionHook(),
   sync: async () => {
     p.intro(gradient("  sync  "));
     const healed = syncWorktrees();
