@@ -193,33 +193,6 @@ export async function pulse<T>(
   }
 }
 
-/**
- * Run blocking work without freezing the spinner.
- *
- * Scanning is synchronous file I/O across thousands of transcripts, which
- * holds the event loop and stops any spinner from painting — the command looks
- * hung. Yielding between units lets the frame render and gives the caller a
- * place to report progress.
- */
-export async function withProgress<Item, Result>(
-  items: Item[],
-  each: (item: Item, index: number) => Result,
-  onTick?: (done: number, total: number) => void
-): Promise<Result[]> {
-  const out: Result[] = [];
-  for (let i = 0; i < items.length; i++) {
-    out.push(each(items[i], i));
-    // Every few units is enough to keep the loop responsive without the
-    // yields themselves dominating the run.
-    if (i % 25 === 0) {
-      onTick?.(i + 1, items.length);
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  }
-  onTick?.(items.length, items.length);
-  return out;
-}
-
 export function tierSwatch(tier: number): string {
   const colors = [pc.green, pc.yellow, pc.red];
   const fn = colors[tier - 1] ?? pc.dim;

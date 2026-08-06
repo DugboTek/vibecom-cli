@@ -30,6 +30,7 @@ import {
   listWorktrees,
   projectRoot,
   readProjectToken,
+  CANONICAL_ORIGIN,
   GLOBAL_SETTINGS_FILE,
   readGlobalToken,
   GLOBAL_SLOT_ROOT,
@@ -1336,6 +1337,119 @@ function slotHere(): ProjectSlot {
   return slot;
 }
 
+/**
+ * Answer "is it actually tracking me?" without a support thread.
+ *
+ * Every part of this could be checked by hand — read the settings file, find
+ * the token, post to the ingest endpoint, look at the response — and every
+ * part of it was, repeatedly, because the pieces live in four places and a
+ * silent failure looks exactly like a working install. The whole point is that
+ * it ends on a yes or a no.
+ */
+async function doctor() {
+  p.intro(gradient("  doctor  "));
+  const problems: string[] = [];
+  const say = (ok: boolean, good: string, bad_: string, fix?: string) => {
+    console.log(bullet(`${ok ? pc.green("✔") : pc.red("✖")} ${ok ? good : bad_}`));
+    if (!ok && fix) problems.push(fix);
+  };
+
+  const cred = readCredentials();
+  say(
+    Boolean(cred),
+    `signed in as ${pc.bold(cred?.username ?? "")}`,
+    "not signed in",
+    "vibecom login"
+  );
+
+  const machineWide = globalTrackingOn();
+  const slots = listSlots();
+  say(
+    machineWide || slots.length > 0,
+    machineWide
+      ? "tracking every project on this computer"
+      : `tracking ${slots.length} linked project${slots.length === 1 ? "" : "s"}`,
+    "nothing is being tracked",
+    "vibecom  (choose Track every project on this computer)"
+  );
+
+  /* A token pointing at a host that no longer issues it is the failure mode
+     that looks most like success: the file is present, the exporter is
+     configured, and every upload is refused. */
+  const token = machineWide
+    ? readGlobalToken()
+    : (slots.map((slot) => readProjectToken(slot.root)).find(Boolean) ?? null);
+  say(
+    Boolean(token),
+    "found the ingest token",
+    "no ingest token on disk",
+    "vibecom"
+  );
+
+  /* Comparing the link against the credential catches a half-migrated setup,
+     but not one where both were written against a host that has since moved —
+     which passes every local check and fails every upload. Name the canonical
+     host as well. */
+  const origin = cred?.origin ?? resolveOrigin();
+  for (const slotOrigin of new Set(slots.map((slot) => slot.origin))) {
+    if (slotOrigin !== origin) {
+      say(
+        false,
+        "",
+        `a link points at ${pc.cyan(slotOrigin)} but you are signed in to ${pc.cyan(origin)}`,
+        "vibecom  (unlink the stale project, then track this computer)"
+      );
+    } else if (slotOrigin !== CANONICAL_ORIGIN) {
+      say(
+        false,
+        "",
+        `still reporting to ${pc.cyan(slotOrigin)}, which is not ${pc.cyan(CANONICAL_ORIGIN)}`,
+        `VIBECOM_ORIGIN=${CANONICAL_ORIGIN} vibecom login`
+      );
+    } else {
+      say(true, `reporting to ${pc.cyan(slotOrigin)}`, "");
+    }
+  }
+
+  if (token) {
+    const reachable = await pulse(
+      "checking the server accepts this token",
+      sendScanned(origin, token, []).then(
+        () => true,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      )
+    );
+    say(
+      reachable === true,
+      "the server accepts your token",
+      typeof reachable === "string" ? reachable : "the server rejected your token",
+      "vibecom login"
+    );
+  }
+
+  const tools = transcriptSources().filter((source) => source.files.length > 0);
+  say(
+    tools.length > 0,
+    `found sessions from ${tools
+      .map((source) => source.tool)
+      .join(", ")}`,
+    "no Claude Code, Codex or Kimi sessions on this machine yet",
+    undefined
+  );
+
+  console.log();
+  if (problems.length === 0) {
+    p.outro(
+      `${pc.green("Everything is working.")} ${pc.dim(
+        "Code as normal — activity uploads on its own."
+      )}`
+    );
+    return;
+  }
+  p.note(problems.map((fix) => `  ${pc.bold(fix)}`).join("\n"), "run this");
+  p.outro(pc.dim("re-run vibecom doctor when you have"));
+}
+
 async function status() {
   const cred = readCredentials();
   p.intro(gradient("  status  "));
@@ -1400,12 +1514,16 @@ async function help() {
     ["link [dir]", "connect projects under a directory"],
     ["preview", "show exactly what leaves this repo"],
     ["status", "linked projects and trusted owners"],
+    ["doctor", "check tracking really works, end to end"],
     ["sync", "cover worktrees created since linking"],
     ["scan", "import usage from running + past sessions"],
     ["rescan", "re-import everything, correcting old timestamps"],
     ["update", "pull the newest CLI from your server"],
     ["unlink", "stop collecting from this repo"],
     ["trust <owner>", "allow repos under an org you control"],
+    // Implemented since trust existed but never listed, so the only way to undo
+    // a trust decision was to know the command already or edit the config file.
+    ["untrust <owner>", "undo that, so its repos need review again"],
     ["logout", "remove stored credentials"],
   ] as [string, string][]) {
     console.log(bullet(`${pc.bold(cmd.padEnd(15))} ${pc.dim(desc)}`));
@@ -1573,6 +1691,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.log.success("signed out");
     p.log.warn("linked projects keep their own tokens — unlink them or revoke at /settings");
   },
+  doctor: () => doctor(),
   help: () => help(),
 };
 

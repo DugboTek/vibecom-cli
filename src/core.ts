@@ -144,6 +144,14 @@ export const clearCredentials = () => fs.rmSync(CRED_FILE, { force: true });
  * login talks to the host you logged into — never wherever the CLI was
  * downloaded from. Explicit env var always wins.
  */
+/**
+ * The host that serves directly.
+ *
+ * A redirecting origin strips the Authorization header off every request, so
+ * this must never be the apex — vibecom.build 308s to www.
+ */
+export const CANONICAL_ORIGIN = "https://www.vibecom.build";
+
 export function resolveOrigin(): string {
   if (process.env.VIBECOM_ORIGIN) return secureOrigin(process.env.VIBECOM_ORIGIN);
   if (process.env.VIBELAND_ORIGIN) return secureOrigin(process.env.VIBELAND_ORIGIN);
@@ -153,9 +161,7 @@ export function resolveOrigin(): string {
   try {
     savedOrigin = fs.readFileSync(ORIGIN_FILE, "utf8").trim();
   } catch {
-    // Must be the host that serves directly — a redirecting origin
-    // would strip the Authorization header off every request.
-    return "https://www.vibecom.build";
+    return CANONICAL_ORIGIN;
   }
   return secureOrigin(savedOrigin);
 }
