@@ -620,7 +620,7 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
      off disk and a round trip per batch. Both run together, so the story costs
      nothing and the wait stops feeling like one. */
   const scanning = runScan();
-  await playReel();
+  await playReel(cred.username);
   const scan = await pulse("importing your existing activity", scanning);
   for (const failure of scan.failed) p.log.warn(failure);
   if (scan.tokens > 0) {
@@ -1765,11 +1765,12 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   demo: () => runDemo(),
   doctor: () => doctor(),
   reel: async (args: string[]) => {
+    const who = readCredentials()?.username;
     if (args.includes("--frames")) {
-      for (const frame of reelFrames()) console.log(frame + "\n");
+      for (const frame of reelFrames(who)) console.log(frame + "\n");
       return;
     }
-    await playReel();
+    await playReel(who);
   },
   help: () => help(),
 };

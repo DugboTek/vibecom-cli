@@ -92,7 +92,7 @@ export async function runDemo(): Promise<void> {
     1200
   );
 
-  await playReel();
+  await playReel("chrismicah");
 
   await step("importing your existing activity", "imported 143 coding sessions", 1500);
 

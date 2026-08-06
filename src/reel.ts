@@ -15,8 +15,8 @@ import { canAnimate, gradient } from "./ui";
  * stays put underneath.
  */
 
-const WIDTH = 44;
-const HEIGHT = 9;
+const WIDTH = 60;
+const HEIGHT = 10;
 
 /** Sprocket holes, so the frame reads as film rather than a box. */
 const PERF = "▖▘".repeat(WIDTH / 2);
@@ -27,122 +27,150 @@ type Frame = { art: string[]; caption: string };
    produce something regular and lifeless. Each is exactly HEIGHT lines. */
 const FRAMES: Frame[] = [
   {
-    caption: "a desk, a machine, nothing yet",
+    caption: "a desk, a laptop, nothing yet",
     art: [
-      "                                            ",
-      "                                            ",
-      "             ╭────────────────────╮         ",
-      "             │                    │         ",
-      "             ╰────────────────────╯         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                                                            ",
+      "                                                            ",
+      "                                                            ",
+      "                                                            ",
+      "                                 ╭──────────────────────╮   ",
+      "                                 │                       │  ",
+      "                                 │                       │  ",
+      "     ════════════════════════════╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
     caption: "somebody sits down",
     art: [
-      "                                            ",
-      "          ○                                 ",
-      "         ╱│╲ ╭────────────────────╮         ",
-      "          │  │                    │         ",
-      "         ╱ ╲ ╰────────────────────╯         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                                                            ",
+      "                                                            ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │                       │  ",
+      "                     │       │   │                       │  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
-    caption: "hands on the keys",
+    caption: "hands on the keyboard",
     art: [
-      "                                            ",
-      "          ○                                 ",
-      "         ╱│╲ ╭────────────────────╮         ",
-      "          │══│ ▍                  │         ",
-      "         ╱ ╲ ╰────────────────────╯         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                                                            ",
+      "                                                            ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍                   │  ",
+      "                     │       ├───│                       │  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
+    ],
+  },
+  {
+    caption: "the first lines of a project",
+    art: [
+      "                                                            ",
+      "                                 ·   ✦                      ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍▍▍▍▍▍▍             │  ",
+      "                     │       ├───│ ▍▍▍▍▍▍▍▍              │  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
     caption: "it starts answering back",
     art: [
-      "                                            ",
-      "          ○           ·   ✦                 ",
-      "         ╱│╲ ╭────────────────────╮         ",
-      "          │══│ ▍▍▍▍▍▍             │         ",
-      "         ╱ ╲ │ ▍▍▍▍▍▍▍▍▍▍▍        │         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                                                            ",
+      "                             ✦   ·   ✦   ·                  ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍       │  ",
+      "                     │       ├───│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍      │  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
     caption: "something is taking shape",
     art: [
-      "                       ▄▄▄▄                 ",
-      "          ○        ·  ██████  ·  ✦          ",
-      "         ╱│╲ ╭────────────────────╮         ",
-      "          │══│ ▍▍▍▍▍▍▍▍▍▍         │         ",
-      "         ╱ ╲ │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍     │         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                                 ▄▄▄▄▄▄                     ",
+      "                              ·  ██████████  ·              ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍    │  ",
+      "                     │       ├───│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍  │  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
     caption: "it stands up on its own",
     art: [
-      "                    ▄▄▄▄▄▄▄▄▄▄              ",
-      "      ✦   ○     ·  ████████████  ·   ✦      ",
-      "         ╱│╲ ╭────────────────────╮         ",
-      "          │══│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍     │         ",
-      "         ╱ ╲ │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍ │         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                            ▄▄▄▄▄▄▄▄▄▄▄▄▄▄                  ",
+      "                         ·  ██████████████████  ·           ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍    │  ",
+      "                     │       ├───│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍│  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
   {
-    caption: "you ship it",
+    caption: "you ship it, and it counts",
     art: [
-      "                  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄        ↗   ",
-      "      ✦  \\○/    ·  ████████████████  ·      ",
-      "          │  ╭────────────────────╮         ",
-      "          │══│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍ │         ",
-      "         ╱ ╲ │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍ │         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
-    ],
-  },
-  {
-    caption: "and every token counts",
-    art: [
-      "     ♥            ▄▄▄▄▄▄▄▄▄▄▄▄▄▄     ↗    ♥ ",
-      "         \\○/   ·  ████████████████  ·       ",
-      "          │  ╭────────────────────╮         ",
-      "          │══│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍ │         ",
-      "         ╱ ╲ │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍ │         ",
-      "            ▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙        ",
-      "      ──────────────────────────────────    ",
-      "                                            ",
-      "                                            ",
+      "                        ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄      ↗       ",
+      "      ♥                  ██████████████████████████   ♥     ",
+      "                       ╭───╮                                ",
+      "                       │ ◕ │                                ",
+      "                       ╰─┬─╯     ╭──────────────────────╮   ",
+      "                     ╭───┴───╮   │ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍    │  ",
+      "                     │       ├───│ ▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍▍│  ",
+      "     ════════════════┴───────┴═══╰──────────────────────╯   ",
+      "     ─────────────────────────▟▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▙    ",
+      "                                                            ",
     ],
   },
 ];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function render(frame: Frame, index: number, shift: number): string {
+/**
+ * Put the person's name in the story.
+ *
+ * "somebody sits down" is a stock animation playing at you. The same frames
+ * with your own handle in them are about you, which is the difference between
+ * a loading screen and a welcome — and this is the one moment the tool has
+ * their full attention.
+ */
+function personalise(caption: string, name?: string): string {
+  if (!name) return caption;
+  if (caption.startsWith("somebody sits down")) return `${name} sits down`;
+  if (caption.startsWith("you ship it")) return `you ship it, ${name} — and it counts`;
+  return caption;
+}
+
+function render(
+  frame: Frame,
+  index: number,
+  shift: number,
+  name?: string
+): string {
   const lines = [
     pc.dim(PERF),
     ...frame.art.map((line, row) => gradient(line, shift + row * 0.03)),
@@ -151,7 +179,7 @@ function render(frame: Frame, index: number, shift: number): string {
        caption drawn over a longer one leaves the tail of the longer one on
        screen, and the line reads as two captions spliced together. */
     `  ${pc.dim(`${index + 1}/${FRAMES.length}`)}  ${pc.bold(
-      frame.caption.padEnd(WIDTH - 6)
+      personalise(frame.caption, name).padEnd(WIDTH - 6)
     )}`,
   ];
   return lines.map((line) => `  ${line}`).join("\n");
@@ -165,15 +193,15 @@ const LINES = HEIGHT + 3;
  * cannot animate, so piped output and CI logs still get the picture without a
  * hundred repainted copies of it.
  */
-export async function playReel(): Promise<void> {
+export async function playReel(name?: string): Promise<void> {
   if (!canAnimate) {
-    console.log(render(FRAMES[FRAMES.length - 1], FRAMES.length - 1, 0));
+    console.log(render(FRAMES[FRAMES.length - 1], FRAMES.length - 1, 0, name));
     return;
   }
   process.stdout.write("\x1b[?25l"); // hide the cursor while it repaints
   try {
     for (let i = 0; i < FRAMES.length; i++) {
-      const body = render(FRAMES[i], i, i * 0.08);
+      const body = render(FRAMES[i], i, i * 0.08, name);
       process.stdout.write(i === 0 ? body + "\n" : `\x1b[${LINES}A` + body + "\n");
       await sleep(i === FRAMES.length - 1 ? 700 : 420);
     }
@@ -183,6 +211,6 @@ export async function playReel(): Promise<void> {
 }
 
 /** Every frame, one after another — for screenshots and the README. */
-export function reelFrames(): string[] {
-  return FRAMES.map((frame, index) => render(frame, index, index * 0.08));
+export function reelFrames(name?: string): string[] {
+  return FRAMES.map((frame, index) => render(frame, index, index * 0.08, name));
 }
