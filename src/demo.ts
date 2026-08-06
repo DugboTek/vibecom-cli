@@ -82,7 +82,7 @@ export async function runDemo(): Promise<void> {
   await beat(800);
 
   console.log(`${pc.dim("│")}`);
-  console.log(`${pc.green("◆")}  Track my coding activity everywhere?`);
+  console.log(`${pc.green("◆")}  Track my token usage everywhere?`);
   console.log(`${pc.dim("│")}  ${pc.green("●")} Yes ${pc.dim("/ ○ No")}`);
   await beat(1000);
 
@@ -94,7 +94,7 @@ export async function runDemo(): Promise<void> {
 
   await playReel("chrismicah");
 
-  await step("importing your existing activity", "imported 143 coding sessions", 1500);
+  await step("importing your token history", "imported 143 coding sessions", 1500);
 
   /* Numbers chosen to land mid-ladder: a rank with a name worth reading, and a
      bar far enough along to look earned but not finished. */

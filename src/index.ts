@@ -597,7 +597,7 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
 
   const proceed = orExit(
     await p.confirm({
-      message: "Track my coding activity everywhere?",
+      message: "Track my token usage everywhere?",
       initialValue: true,
     })
   );
@@ -621,7 +621,7 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
      nothing and the wait stops feeling like one. */
   const scanning = runScan();
   await playReel(cred.username);
-  const scan = await pulse("importing your existing activity", scanning);
+  const scan = await pulse("importing your token history", scanning);
   for (const failure of scan.failed) p.log.warn(failure);
   if (scan.tokens > 0) {
     p.note(
@@ -1047,7 +1047,7 @@ async function menu(cred: Credentials): Promise<boolean> {
   switch (action) {
     case "global": {
       if (await linkGlobal(cred, cred.origin || resolveOrigin())) {
-        const scan = await pulse("importing your existing activity", runScan());
+        const scan = await pulse("importing your token history", runScan());
         for (const failure of scan.failed) p.log.warn(failure);
         if (scan.tokens > 0) {
           p.note(
@@ -1587,7 +1587,7 @@ async function help() {
     ["doctor", "check tracking really works, end to end"],
     ["demo", "play the onboarding as a simulation, changing nothing"],
     ["sync", "cover worktrees created since linking"],
-    ["scan", "import usage from running + past sessions"],
+    ["scan", "import token usage from past sessions"],
     ["rescan", "re-import everything, correcting old timestamps"],
     ["update", "pull the newest CLI from your server"],
     ["unlink", "stop collecting from this repo"],
