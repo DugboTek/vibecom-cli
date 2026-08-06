@@ -147,7 +147,12 @@ function render(frame: Frame, index: number, shift: number): string {
     pc.dim(PERF),
     ...frame.art.map((line, row) => gradient(line, shift + row * 0.03)),
     pc.dim(PERF),
-    `  ${pc.dim(`${index + 1}/${FRAMES.length}`)}  ${pc.bold(frame.caption)}`,
+    /* Padded to a fixed width because the strip repaints in place: a shorter
+       caption drawn over a longer one leaves the tail of the longer one on
+       screen, and the line reads as two captions spliced together. */
+    `  ${pc.dim(`${index + 1}/${FRAMES.length}`)}  ${pc.bold(
+      frame.caption.padEnd(WIDTH - 6)
+    )}`,
   ];
   return lines.map((line) => `  ${line}`).join("\n");
 }

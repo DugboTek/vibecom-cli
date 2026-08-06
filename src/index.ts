@@ -586,17 +586,15 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
       pc.bold(gradient("  your rank  "))
     );
   }
-  p.note(
-    [
-      scan.sessions > 0
-        ? `${pc.green("✔")} Imported ${scan.sessions} coding session${scan.sessions === 1 ? "" : "s"}.`
-        : `${pc.green("✔")} Connected. Your first activity will appear automatically.`,
-      tools.length > 0 ? `${pc.green("✔")} Tracking ${tools.join(" + ")}.` : "",
-      "",
-      pc.dim("Your code, prompts, and file paths never leave this computer."),
-    ].filter(Boolean).join("\n"),
-    "you're live"
-  );
+  /* showState draws a fuller "you're live" immediately after this, so a second
+     box under the same title read as a stutter — two success panels claiming
+     the same thing. Report only what the import did; the state screen owns the
+     summary. */
+  if (scan.sessions > 0) {
+    p.log.success(
+      `Imported ${scan.sessions} coding session${scan.sessions === 1 ? "" : "s"}.`
+    );
+  }
   return count;
 }
 
