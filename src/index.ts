@@ -215,11 +215,51 @@ async function repairOriginDrift(cred: Credentials): Promise<void> {
   }
 
   const projects = stale.filter((slot) => slot.root !== GLOBAL_SLOT_ROOT);
+  if (projects.length === 0) return;
+
+  /* Re-point rather than warn. Telling somebody to unlink twenty-five projects
+     by hand is not a fix — it is a list of chores whose only outcome is losing
+     the per-project attribution they were linked for. The salt and root are
+     reused deliberately: projectIdFor(salt, root) is unchanged, so the new
+     token carries the same project id and the history already recorded under it
+     stays that project's history. */
+  const spin = p.spinner();
+  spin.start(`re-pointing ${projects.length} project(s) at ${cred.origin}`);
+  const stuck: string[] = [];
+  let moved = 0;
+
   for (const slot of projects) {
-    p.log.warn(
-      `${pc.bold(slot.label)} still reports to ${pc.dim(slot.origin)} — ` +
-        `choose "Stop collecting from a project" to drop it`
-    );
+    try {
+      const minted = await mintProjectToken(cred.origin, cred.token, {
+        projectId: slot.projectId,
+        projectLabel: slot.label,
+        tier: slot.tier,
+      });
+      const trees = listWorktrees(slot.root);
+      for (const tree of trees) prepareProjectSettings(tree);
+      for (const tree of trees) {
+        writeProjectSettings(tree, cred.origin, minted.access_token);
+      }
+      writeSlot({ ...slot, origin: cred.origin });
+      /* Only once the new credential is in place. A token revoked before its
+         replacement lands would leave that project reporting nowhere. */
+      await revokeProjectToken(slot.origin, cred.token, slot.projectId).catch(
+        () => undefined
+      );
+      moved += 1;
+    } catch {
+      /* Leave the slot untouched. It still reports to the old origin, which is
+         worse than being current but far better than being broken. */
+      stuck.push(slot.label);
+    }
+  }
+
+  spin.stop(
+    `${moved} project(s) now report to ${pc.cyan(cred.origin)}` +
+      (stuck.length > 0 ? pc.yellow(`  ${stuck.length} could not be moved`) : "")
+  );
+  for (const label of stuck) {
+    p.log.warn(`${pc.bold(label)} still reports to its old host — run vibecom doctor`);
   }
 }
 

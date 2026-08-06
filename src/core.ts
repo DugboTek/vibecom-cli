@@ -596,7 +596,16 @@ export function listWorktrees(cwd = process.cwd()): string[] {
     .filter((l) => l.startsWith("worktree "))
     .map((l) => l.slice("worktree ".length).trim())
     .filter(Boolean)
-    .map(realpath);
+    .map(realpath)
+    /* Git keeps listing a checkout whose .git has been removed — it reports it
+       as `prunable` and still hands it to us. Agent tools leave these behind
+       constantly. Every git command inside one fails, so the ignore rule can
+       never be verified there, and prepareProjectSettings refuses to write a
+       token it cannot prove is protected. That refusal is correct, but it was
+       aborting the whole repository: five live projects could not be linked or
+       re-pointed because of one directory that no longer had a .git in it. A
+       checkout without one is not a checkout. */
+    .filter((tree) => fs.existsSync(path.join(tree, ".git")));
 }
 
 export const gitRemote = (root: string) =>

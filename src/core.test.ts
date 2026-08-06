@@ -601,3 +601,33 @@ test("http is allowed for loopback only, so local testing needs no fake TLS", ()
   assert.throws(() => secureOrigin("http://localhost.evil.com"), /HTTPS/);
   assert.throws(() => secureOrigin("http://user:pass@localhost:3000"), /userinfo/);
 });
+
+test("a checkout whose .git has been removed is not listed as a worktree", () => {
+  /* Agent tools leave these behind: the directory survives, the .git does not,
+     and git still reports it as `prunable`. Every git command inside one fails,
+     so the ignore rule cannot be verified and prepareProjectSettings refuses to
+     write a token there — correctly. Returning it anyway made that refusal
+     abort the whole repository. */
+  const main = repo("ghost-worktree");
+  execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: main });
+  execFileSync("git", ["config", "user.name", "t"], { cwd: main });
+  fs.writeFileSync(path.join(main, "README"), "x\n");
+  execFileSync("git", ["add", "-A"], { cwd: main, stdio: "ignore" });
+  execFileSync("git", ["commit", "-qm", "init"], { cwd: main, stdio: "ignore" });
+
+  const tree = path.join(tmp, "ghost-checkout");
+  execFileSync("git", ["worktree", "add", "-q", "-b", "ghost", tree], {
+    cwd: main,
+    stdio: "ignore",
+  });
+  assert.equal(listWorktrees(main).length, 2, "both checkouts before removal");
+
+  fs.rmSync(path.join(tree, ".git"), { recursive: true, force: true });
+  const live = listWorktrees(main);
+  assert.equal(live.length, 1, "the .git-less checkout is dropped");
+  assert.equal(live[0], fs.realpathSync(main));
+  assert.ok(
+    fs.existsSync(tree),
+    "the directory itself is left alone — this is a reporting decision, not a cleanup"
+  );
+});
