@@ -16,17 +16,26 @@ import {
   AUTOPILOT_FILE,
   DEFAULT_AUTOPILOT,
   claudeSettingsPath,
+  clearSlotStale,
   describeAction,
   installSessionHook,
+  isSlotStale,
+  listStaleSlots,
+  markSlotStale,
   readAutopilot,
   removeSessionHook,
   runAutopilot,
   scanDue,
   sessionHookInstalled,
+  staleReason,
   writeAutopilot,
 } from "./autopilot";
 import {
   CONFIG_DIR,
+  EXCLUDED_FILE,
+  GLOBAL_SLOT_ROOT,
+  excludeOwner,
+  excludeRoot,
   readProjectToken,
   writeProjectSettings,
   writeSlot,
@@ -239,6 +248,147 @@ test("autoLink off leaves an eligible repository alone", async () => {
   });
   assert.equal(action.kind, "idle");
   assert.equal(spy.calls.length, 0);
+});
+
+/* ------- exclusion gates auto-link (§6, D3) ------- */
+
+test("an excluded root is never auto-linked", async () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  const root = repo("git@github.com:DugboTek/mine.git");
+  excludeRoot(root);
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "skipped");
+  assert.equal(action.kind === "skipped" ? action.reason : "", "excluded");
+  assert.equal(spy.calls.length, 0);
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+test("an excluded owner's repository is never auto-linked, even though it would otherwise be trusted", async () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  const root = repo("git@github.com:dugbotek/mine.git");
+  excludeOwner("dugbotek");
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "skipped");
+  assert.match(action.kind === "skipped" ? action.reason : "", /excluded/);
+  assert.equal(spy.calls.length, 0);
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+test("an unreadable excluded.json refuses to auto-link rather than assume nothing is excluded", async () => {
+  fs.mkdirSync(path.dirname(EXCLUDED_FILE), { recursive: true });
+  fs.writeFileSync(EXCLUDED_FILE, "{ not json");
+  const root = repo("git@github.com:DugboTek/mine.git");
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "skipped");
+  assert.match(
+    action.kind === "skipped" ? action.reason : "",
+    /unreadable/
+  );
+  assert.equal(spy.calls.length, 0, "an unverifiable exclusion list must not link");
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+/* ------- never re-mint after a server-side revocation (§4.3, D8) ------- */
+
+test("a stale project is left alone entirely — no cover, no re-link, no describeAction noise beyond the revocation line", async () => {
+  const root = repo("git@github.com:DugboTek/revoked.git");
+  writeProjectSettings(root, CRED.origin, "now-revoked-token");
+  writeSlot({
+    root,
+    salt: "s",
+    projectId: "p",
+    tier: 1,
+    label: "revoked",
+    origin: CRED.origin,
+    linkedAt: new Date().toISOString(),
+  });
+  markSlotStale(root, "revoked");
+
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "stale");
+  assert.equal(spy.calls.length, 0, "a stale slot is never re-minted");
+  const line = describeAction(action);
+  assert.match(line ?? "", /revoked/);
+  assert.match(line ?? "", /relink or unlink/);
+});
+
+test("a stale repository that was never linked locally is still refused, not auto-linked as if new", async () => {
+  // The scenario §4.3 exists for: the local slot may already be gone (hand
+  // unlink after revocation, or a future flow that clears it), but staleness
+  // must still block a fresh auto-link from minting a brand new grant.
+  const root = repo("git@github.com:DugboTek/never-locally-linked.git");
+  markSlotStale(root, "revoked");
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "stale");
+  assert.equal(spy.calls.length, 0);
+});
+
+test("markSlotStale does not reset staleSince on a second revocation", () => {
+  const root = "/code/repeat-offender";
+  markSlotStale(root, "revoked");
+  const first = listStaleSlots().find((s) => s.root === root)!;
+  markSlotStale(root, "revoked again");
+  const second = listStaleSlots().find((s) => s.root === root)!;
+  assert.equal(second.staleSince, first.staleSince);
+  assert.equal(staleReason(root), "revoked", "the first reason is kept");
+  clearSlotStale(root);
+});
+
+test("clearSlotStale is the only way back — after it, autopilot behaves normally again", async () => {
+  const root = repo("git@github.com:DugboTek/healed.git");
+  markSlotStale(root);
+  assert.equal(isSlotStale(root), true);
+
+  clearSlotStale(root);
+  assert.equal(isSlotStale(root), false);
+  assert.equal(staleReason(root), null);
+
+  const spy = spyLink();
+  const action = await runAutopilot(root, {
+    credentials: CRED,
+    config: config(),
+    link: spy.link,
+  });
+  assert.equal(action.kind, "linked", "a cleared slot is eligible again");
+});
+
+test("clearing a slot that was never stale is a no-op", () => {
+  assert.doesNotThrow(() => clearSlotStale("/code/never-stale"));
+});
+
+test("the global slot can be marked and queried like any other root", () => {
+  // GLOBAL_SLOT_ROOT is just a string key here — a revoked machine-wide
+  // token uses the same storage, per §4.3's "the same rule applies to the
+  // global token".
+  markSlotStale(GLOBAL_SLOT_ROOT, "revoked");
+  assert.equal(isSlotStale(GLOBAL_SLOT_ROOT), true);
+  clearSlotStale(GLOBAL_SLOT_ROOT);
+  assert.equal(isSlotStale(GLOBAL_SLOT_ROOT), false);
 });
 
 /* ------- covering checkouts of a project already linked ------- */

@@ -8,10 +8,13 @@ import {
   type ProjectSlot,
   ensureExcluded,
   gitRemote,
+  isOwnerExcluded,
+  isRootExcluded,
   isTrusted,
   linkRepo,
   listWorktrees,
   projectRoot,
+  readExcluded,
   readJson,
   readProjectToken,
   readSlot,
@@ -119,6 +122,63 @@ export function markScanned(now = Date.now()): void {
   writeJson(STATE_FILE, { lastScanAt: new Date(now).toISOString() });
 }
 
+/* ------- stale (server-revoked) slots ------- */
+
+const STALE_FILE = path.join(CONFIG_DIR, "stale-slots.json");
+
+/** `root` (or `GLOBAL_SLOT_ROOT` for the machine-wide token) -> when and why
+ *  the server refused it. */
+type StaleSlots = Record<string, { staleSince: string; reason: string }>;
+
+const readStaleSlots = (): StaleSlots => readJson<StaleSlots>(STALE_FILE, {});
+
+export function isSlotStale(root: string): boolean {
+  return root in readStaleSlots();
+}
+
+/**
+ * Record that a project's (or the global slot's) token was refused by the
+ * server with 401/403.
+ *
+ * Revocation — from the settings page, or by rotating credentials — is the
+ * one signal a user has that unambiguously means "stop this" without the CLI
+ * having initiated it. Auto-healing a *missing* settings file is the right
+ * call (that is what `coverWorktrees` below does, and what the branch this
+ * module came from was built for); auto-healing a *revoked* token would
+ * silently override an explicit act of consent withdrawal. Once a slot is
+ * marked, `runAutopilot` backs off from it entirely — no worktree coverage,
+ * no re-link, no re-mint — until a person runs the CLI and either relinks
+ * (reusing the stored salt, so the project id and its history reattach) or
+ * unlinks. `clearSlotStale` is that resolution; nothing else may call it.
+ *
+ * First revocation wins: a second 401 on an already-stale slot must not
+ * reset `staleSince`, or "how long has this been broken" becomes unreadable.
+ */
+export function markSlotStale(root: string, reason = "revoked"): void {
+  const stale = readStaleSlots();
+  if (stale[root]) return;
+  stale[root] = { staleSince: new Date().toISOString(), reason };
+  writeJson(STALE_FILE, stale);
+}
+
+/** The only way staleness is cleared — an explicit, interactive relink or
+ *  unlink, never anything unattended. */
+export function clearSlotStale(root: string): void {
+  const stale = readStaleSlots();
+  if (!(root in stale)) return;
+  delete stale[root];
+  writeJson(STALE_FILE, stale);
+}
+
+export function staleReason(root: string): string | null {
+  return readStaleSlots()[root]?.reason ?? null;
+}
+
+/** Every stale slot, for `status`/`doctor` to list. */
+export function listStaleSlots(): { root: string; staleSince: string; reason: string }[] {
+  return Object.entries(readStaleSlots()).map(([root, v]) => ({ root, ...v }));
+}
+
 /* ------- the decision ------- */
 
 export type AutopilotAction =
@@ -128,7 +188,10 @@ export type AutopilotAction =
   /** an unlinked repository under a trusted owner was connected */
   | { kind: "linked"; label: string; owner: string | null; worktrees: number }
   /** deliberately left alone, with the reason worth surfacing */
-  | { kind: "skipped"; label: string; owner: string | null; reason: string };
+  | { kind: "skipped"; label: string; owner: string | null; reason: string }
+  /** the server revoked this project's token; autopilot will not touch it
+      again until a person relinks or unlinks (§4.3, D8) */
+  | { kind: "stale"; label: string };
 
 export type AutopilotDeps = {
   credentials: Credentials | null;
@@ -156,18 +219,49 @@ export async function runAutopilot(
   const root = projectRoot(cwd);
   if (!root) return { kind: "idle" };
 
+  /* A revoked token is consent withdrawn, not a gap to heal. This gate sits
+     ahead of everything else so it protects both branches below alike: a
+     slot that still exists locally (coverWorktrees would otherwise happily
+     copy the now-dead token into a new worktree) and a slot that is gone
+     (the auto-link branch would otherwise see a clean unlinked repository
+     and mint a fresh grant nobody asked for). */
+  if (isSlotStale(root)) {
+    return { kind: "stale", label: path.basename(root) };
+  }
+
   const slot = readSlot(root);
   if (slot) return coverWorktrees(slot);
 
   if (!config.autoLink) return { kind: "idle" };
 
-  const owner = remoteOwner(gitRemote(root));
   const label = path.basename(root);
+
+  /* Same posture as an unreadable autopilot config: a person cannot rely on
+     "declining an owner excludes them" (D3) if the file that remembers the
+     decline cannot be read, so an untrustworthy `excluded.json` refuses to
+     link rather than assume the coast is clear. */
+  const excludedRead = readExcluded();
+  if (!excludedRead.ok) {
+    return {
+      kind: "skipped",
+      label,
+      owner: null,
+      reason: "exclusion list unreadable — run `vibecom doctor`",
+    };
+  }
+  if (isRootExcluded(excludedRead.excluded, root)) {
+    return { kind: "skipped", label, owner: null, reason: "excluded" };
+  }
+
+  const owner = remoteOwner(gitRemote(root));
   /* A repository with no readable remote owner is never linked unattended.
      Ownership is the only evidence available here that the work is the
      builder's to report, and `vibecom link` remains one command away. */
   if (!owner) {
     return { kind: "skipped", label, owner: null, reason: "no remote owner" };
+  }
+  if (isOwnerExcluded(excludedRead.excluded, owner)) {
+    return { kind: "skipped", label, owner, reason: `${owner} is excluded` };
   }
   const mine = owner.toLowerCase() === credentials.username.toLowerCase();
   if (!mine && !isTrusted(owner)) {
@@ -225,6 +319,8 @@ export function describeAction(action: AutopilotAction): string | null {
       return `vibecom: connected ${action.label} (${action.owner}) — ${action.worktrees} checkout${
         action.worktrees === 1 ? "" : "s"
       }. Run \`vibecom unlink\` to stop.`;
+    case "stale":
+      return `vibecom: token for ${action.label} was revoked — run \`vibecom\` to relink or unlink`;
     default:
       return null;
   }

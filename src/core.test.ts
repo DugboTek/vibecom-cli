@@ -1,3 +1,14 @@
+/* Must come first: it plants XDG_CONFIG_HOME before core.ts binds its paths.
+   Several tests below now exercise linkRepo (writes a project slot and scan
+   marks) and the exclusion helpers (write excluded.json), both under
+   CONFIG_DIR — without this they would write into the developer's real
+   ~/.config/vibecom. */
+import {
+  assertSandboxed,
+  cleanupSandbox,
+  sandbox as sandboxHome,
+} from "./testSandbox";
+
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -6,23 +17,42 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 import {
+  CONFIG_DIR,
+  EXCLUDED_FILE,
+  GLOBAL_SLOT_ROOT,
   commonGitDir,
   ensureExcluded,
   ensureGitignored,
+  excludeOwner,
+  excludeRoot,
   gitRoot,
+  includeOwner,
+  includeRoot,
+  isOwnerExcluded,
+  isRootExcluded,
+  linkRepo,
   listWorktrees,
   projectRoot,
+  readExcluded,
   readProjectToken,
+  readScanMarks,
+  removeExclusionSettings,
+  settingsPathFor,
   uncoveredWorktrees,
   projectIdFor,
   recommendedRepos,
   remoteOwner,
   removeProjectSettings,
-  settingsPathFor,
   secureOrigin,
+  writeExclusionSettings,
   writeProjectSettings,
+  writeScanMarks,
   sendScanned,
+  type ScanMark,
 } from "./core";
+
+assertSandboxed(CONFIG_DIR);
+after(cleanupSandbox);
 
 // realpath: macOS symlinks /var -> /private/var, and git reports real paths.
 // Comparing a non-canonical fixture path against a canonical one is a test bug.
@@ -30,6 +60,7 @@ const tmp = fs.realpathSync(
   fs.mkdtempSync(path.join(os.tmpdir(), "vibecom-cli-test-"))
 );
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+void sandboxHome; // imported for its side effect (planting XDG_CONFIG_HOME)
 
 function repo(name: string): string {
   const dir = path.join(tmp, name);
@@ -630,4 +661,287 @@ test("a checkout whose .git has been removed is not listed as a worktree", () =>
     fs.existsSync(tree),
     "the directory itself is left alone — this is a reporting decision, not a cleanup"
   );
+});
+
+/* ------- scanVersion ------- */
+
+test("a mark carrying the bumped scanVersion round-trips", () => {
+  // Documents that the type widening (§10 Phase 1) does not just compile —
+  // marks written under the new value are stored and read back unchanged.
+  const mark: ScanMark = {
+    turns: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    costUsd: 0,
+    file: "/tmp/a.jsonl",
+    lines: 5,
+    mtimeMs: 1,
+    root: "/some/project",
+    activityVersion: 1,
+    scanVersion: 3,
+  };
+  writeScanMarks({ "claude-code:sv3": mark });
+  assert.equal(readScanMarks()["claude-code:sv3"].scanVersion, 3);
+});
+
+/* ------- mark invalidation on link (§5.2, D10) ------- */
+
+function fetchReturning(body: unknown) {
+  return (async () => Response.json(body)) as typeof fetch;
+}
+
+const globalMark = (root: string): ScanMark => ({
+  turns: 1,
+  inputTokens: 10,
+  outputTokens: 2,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  costUsd: 0.01,
+  file: "/tmp/session.jsonl",
+  lines: 20,
+  mtimeMs: 1,
+  root,
+  activityVersion: 1,
+  scanVersion: 2,
+});
+
+test("linking a repo drops scan marks previously bucketed under the global slot", async () => {
+  const dir = repo("link-invalidate-global");
+  writeScanMarks({
+    "claude-code:global-a": globalMark(GLOBAL_SLOT_ROOT),
+    "claude-code:global-b": globalMark(GLOBAL_SLOT_ROOT),
+    "claude-code:already-linked": globalMark("/some/other/project"),
+  });
+
+  const original = globalThis.fetch;
+  globalThis.fetch = fetchReturning({
+    access_token: "proj-token",
+    tier: 1,
+    name: "counters",
+    unlocks: "",
+    collects: [],
+    neverCollects: [],
+  });
+  try {
+    await linkRepo(
+      "https://vibecom.build",
+      "account-token",
+      { root: dir, label: "link-invalidate-global" },
+      1
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  const marks = readScanMarks();
+  assert.equal(
+    marks["claude-code:global-a"],
+    undefined,
+    "a global-rooted mark is dropped so the session is re-attributed"
+  );
+  assert.equal(marks["claude-code:global-b"], undefined);
+  assert.ok(
+    marks["claude-code:already-linked"],
+    "a mark that already names a concrete project root is left untouched"
+  );
+});
+
+test("linking a repo leaves marks alone when nothing was ever bucketed globally", async () => {
+  const dir = repo("link-invalidate-noop");
+  writeScanMarks({
+    "claude-code:elsewhere": globalMark("/some/other/project"),
+  });
+
+  const original = globalThis.fetch;
+  globalThis.fetch = fetchReturning({
+    access_token: "proj-token-2",
+    tier: 1,
+    name: "counters",
+    unlocks: "",
+    collects: [],
+    neverCollects: [],
+  });
+  try {
+    await linkRepo(
+      "https://vibecom.build",
+      "account-token",
+      { root: dir, label: "link-invalidate-noop" },
+      1
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  assert.ok(readScanMarks()["claude-code:elsewhere"]);
+});
+
+/* ------- exclusion (§6, D3) ------- */
+
+test("nothing is excluded before excluded.json exists", () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  const read = readExcluded();
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.excluded, { roots: [], owners: [] });
+});
+
+test("excluding a root round-trips and is idempotent", () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  excludeRoot("/code/employer-repo");
+  excludeRoot("/code/employer-repo"); // must not duplicate
+  const { excluded } = readExcluded();
+  assert.deepEqual(excluded.roots, ["/code/employer-repo"]);
+  assert.equal(isRootExcluded(excluded, "/code/employer-repo"), true);
+  assert.equal(isRootExcluded(excluded, "/code/other"), false);
+});
+
+test("including a root reverses the exclusion", () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  excludeRoot("/code/employer-repo");
+  includeRoot("/code/employer-repo");
+  assert.deepEqual(readExcluded().excluded.roots, []);
+});
+
+test("excluding an owner matches case-insensitively, like trusted_owners.json", () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  excludeOwner("ShotTrackerDEV");
+  const { excluded } = readExcluded();
+  assert.equal(isOwnerExcluded(excluded, "shottrackerdev"), true);
+  assert.equal(isOwnerExcluded(excluded, "SHOTTRACKERDEV"), true);
+  assert.equal(isOwnerExcluded(excluded, "someone-else"), false);
+});
+
+test("including an owner reverses the exclusion, case-insensitively", () => {
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+  excludeOwner("ShotTrackerDEV");
+  includeOwner("shottrackerdev");
+  assert.deepEqual(readExcluded().excluded.owners, []);
+});
+
+test("a hand-truncated excluded.json is reported unreadable, not read as empty", () => {
+  fs.mkdirSync(path.dirname(EXCLUDED_FILE), { recursive: true });
+  fs.writeFileSync(EXCLUDED_FILE, '{ "roots": [ "/code/a", ');
+  const read = readExcluded();
+  assert.equal(
+    read.ok,
+    false,
+    "corrupt JSON must not silently read as 'nothing excluded'"
+  );
+  assert.match(read.reason, /not valid JSON/);
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+test("an excluded.json with the wrong shape is reported unreadable", () => {
+  fs.mkdirSync(path.dirname(EXCLUDED_FILE), { recursive: true });
+  fs.writeFileSync(EXCLUDED_FILE, JSON.stringify({ roots: "not-an-array" }));
+  const read = readExcluded();
+  assert.equal(read.ok, false);
+  assert.match(read.reason, /unexpected shape/);
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+test("excluded.json as a JSON array (not object) is reported unreadable", () => {
+  fs.mkdirSync(path.dirname(EXCLUDED_FILE), { recursive: true });
+  fs.writeFileSync(EXCLUDED_FILE, "[]");
+  const read = readExcluded();
+  assert.equal(read.ok, false);
+  fs.rmSync(EXCLUDED_FILE, { force: true });
+});
+
+test("excluding while the file is corrupt still records the exclusion being asked for", () => {
+  // Same recovery the codebase already accepts for trusted_owners.json and
+  // autopilot.json: the write that fixes the file is not itself refused.
+  fs.mkdirSync(path.dirname(EXCLUDED_FILE), { recursive: true });
+  fs.writeFileSync(EXCLUDED_FILE, "not json at all");
+  excludeRoot("/code/recovered");
+  const read = readExcluded();
+  assert.equal(read.ok, true, "the write repaired the file");
+  assert.deepEqual(read.excluded.roots, ["/code/recovered"]);
+});
+
+/* ------- telemetry-off project settings (§6.1) ------- */
+
+test("writeExclusionSettings disables telemetry without writing a token", () => {
+  const dir = repo("exclusion-settings");
+  const file = writeExclusionSettings(dir);
+  assert.equal(path.basename(file), "settings.local.json");
+  const data = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "0");
+  assert.equal(
+    data.env.OTEL_EXPORTER_OTLP_HEADERS,
+    undefined,
+    "no token belongs in an exclusion write"
+  );
+});
+
+test("writeExclusionSettings survives a machine-wide re-link afterwards", () => {
+  // The whole point: project-level env overrides user-level env per key
+  // (§3.1), so writing telemetry=1 into settings.json (simulated here by a
+  // second write to the same project file, since that is the key that would
+  // collide) must not silently re-enable a checkout that opted out.
+  const dir = repo("exclusion-survives");
+  writeExclusionSettings(dir);
+  const file = settingsPathFor(dir);
+  assert.equal(
+    JSON.parse(fs.readFileSync(file, "utf8")).env.CLAUDE_CODE_ENABLE_TELEMETRY,
+    "0"
+  );
+});
+
+test("writeExclusionSettings preserves unrelated settings and is gitignored", () => {
+  const dir = repo("exclusion-merge");
+  const file = settingsPathFor(dir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ permissions: { allow: ["Bash"] }, env: { MY_VAR: "1" } })
+  );
+  writeExclusionSettings(dir);
+  const data = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepEqual(data.permissions, { allow: ["Bash"] });
+  assert.equal(data.env.MY_VAR, "1");
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "0");
+
+  const tracked = execFileSync("git", ["status", "--porcelain"], {
+    cwd: dir,
+    encoding: "utf8",
+  });
+  assert.ok(
+    !tracked.includes("settings.local.json"),
+    `the exclusion write must still be git-ignored:\n${tracked}`
+  );
+});
+
+test("removeExclusionSettings drops only the key it wrote", () => {
+  const dir = repo("exclusion-remove");
+  writeExclusionSettings(dir);
+  const file = settingsPathFor(dir);
+  let data = JSON.parse(fs.readFileSync(file, "utf8"));
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ ...data, env: { ...data.env, KEEP: "1" } })
+  );
+
+  removeExclusionSettings(dir);
+  data = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, undefined);
+  assert.equal(data.env.KEEP, "1", "unrelated env was not touched");
+});
+
+test("removeExclusionSettings leaves a real project link's telemetry=1 alone", () => {
+  // A repo un-excluded and then linked legitimately carries "1", written by
+  // writeProjectSettings — that value is not removeExclusionSettings's to
+  // touch, or a stale un-exclude could silently turn a live link off.
+  const dir = repo("exclusion-remove-linked");
+  writeProjectSettings(dir, "https://vibecom.build", "tok");
+  removeExclusionSettings(dir);
+  const data = JSON.parse(fs.readFileSync(settingsPathFor(dir), "utf8"));
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "1");
+});
+
+test("removeExclusionSettings on a checkout that was never excluded does nothing", () => {
+  const dir = repo("exclusion-remove-absent");
+  assert.doesNotThrow(() => removeExclusionSettings(dir));
+  assert.equal(fs.existsSync(settingsPathFor(dir)), false);
 });

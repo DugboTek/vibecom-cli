@@ -40,6 +40,7 @@ hour the session occupied, and one record per linked repository, to
 | `session.id` | string | The tool's own session id, or the transcript filename |
 | `model` | string | Model name, e.g. `claude-opus-5`, `gpt-5.6-sol`. Omitted if the transcript does not record one |
 | `turns` | number | Count of human prompts in the session |
+| `sessions` | number | Always `1`. Lets a restated session replace the one-row-per-session counter your coding tool's live connection already sent, so re-importing history never leaves a duplicate |
 | `input_tokens` | number | Sum of input tokens |
 | `output_tokens` | number | Sum of output tokens |
 | `cache_read_tokens` | number | Sum of cache-read tokens |
