@@ -246,6 +246,13 @@ const BEATS = [
   "shipped",
 ];
 
+/* The 67% celebration needs a moment to register before the typing resumes.
+   Keeping the rest of the reel brisk makes that single held pose feel like a
+   deliberate beat, not a slower animation. */
+const FRAME_MS = 320;
+const CELEBRATION_PAGE = 5;
+const CELEBRATION_HOLD_MS = 720;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function personalise(text: string, name?: string): string {
@@ -330,7 +337,9 @@ export async function playReel(
       const body = render(page, beatFor(i), i * 0.03, tokens?.());
       process.stdout.write(i === 0 ? body + "\n" : `\x1b[${LINES}A` + body + "\n");
       if (i >= minimum && (finished || i >= PAGES.length * 3)) break;
-      await sleep(320);
+      await sleep(
+        i % PAGES.length === CELEBRATION_PAGE ? CELEBRATION_HOLD_MS : FRAME_MS
+      );
     }
   } finally {
     process.stdout.write("\x1b[?25h");
