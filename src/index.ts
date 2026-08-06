@@ -31,6 +31,7 @@ import {
   projectRoot,
   readProjectToken,
   GLOBAL_SETTINGS_FILE,
+  readGlobalToken,
   GLOBAL_SLOT_ROOT,
   globalTrackingOn,
   removeGlobalSettings,
@@ -735,13 +736,20 @@ async function runScan(
     if (!usage.model && mark?.model) usage.model = mark.model;
     const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
     const root = cwd ? projectRoot(cwd) : null;
-    const slot = root
-      ? slots.find((s) => s.root === root)
-      : usage.workspaceHash
-        ? slots.find((s) => sha256(s.root).startsWith(usage.workspaceHash!))
-        : mark?.root
-          ? slots.find((s) => s.root === mark.root)
-          : undefined;
+    /* The machine-wide slot has no directory of its own, so it can never win
+       a path comparison. Without it as the fallback every session lands in
+       "unlinked projects — ignored" and the import quietly does nothing while
+       live telemetry keeps flowing. A specific project still wins when one
+       matches, so mixed setups keep their per-project tiers. */
+    const globalSlot = slots.find((s) => s.root === GLOBAL_SLOT_ROOT);
+    const slot =
+      (root
+        ? slots.find((s) => s.root === root)
+        : usage.workspaceHash
+          ? slots.find((s) => sha256(s.root).startsWith(usage.workspaceHash!))
+          : mark?.root
+            ? slots.find((s) => s.root === mark.root)
+            : undefined) ?? globalSlot;
 
     if (!slot) {
       skipped++;
@@ -784,7 +792,10 @@ async function runScan(
 
   for (const [root, list] of byProject) {
     const slot = slots.find((s) => s.root === root)!;
-    const token = readProjectToken(slot.root);
+    const token =
+      slot.root === GLOBAL_SLOT_ROOT
+        ? readGlobalToken()
+        : readProjectToken(slot.root);
     if (!token) continue;
     for (let i = 0; i < list.length; i += 50) {
       const batch = list.slice(i, i + 50);
@@ -935,6 +946,19 @@ async function menu(cred: Credentials): Promise<boolean> {
               },
             ]
           : []),
+        /* Without this there is no route back to whole-machine tracking:
+           declining it at setup, or having linked projects before it existed,
+           both leave a menu that can only ever add one repository at a time.
+           Offered only while it is off, so it never reads as a duplicate. */
+        ...(globalTrackingOn()
+          ? []
+          : [
+              {
+                value: "global" as const,
+                label: "Track every project on this computer",
+                hint: "new projects count automatically",
+              },
+            ]),
         {
           value: "link",
           // "more" is a claim about state. Offering it with nothing linked —
@@ -967,6 +991,23 @@ async function menu(cred: Credentials): Promise<boolean> {
   );
 
   switch (action) {
+    case "global": {
+      if (await linkGlobal(cred, cred.origin || resolveOrigin())) {
+        const scan = await pulse("importing your existing activity", runScan());
+        for (const failure of scan.failed) p.log.warn(failure);
+        if (scan.tokens > 0) {
+          p.note(
+            rankCard(
+              scan.tokens,
+              scan.days,
+              `${cred.origin}/u/${cred.username}`
+            ),
+            pc.bold(gradient("  your rank  "))
+          );
+        }
+      }
+      return true;
+    }
     case "link": {
       const here = projectRoot();
       await runLink(cred, here ? path.dirname(here) : process.cwd());
@@ -1125,7 +1166,11 @@ function showState(cred: Credentials) {
         `${pc.yellow("○")} Signed in as ${pc.bold(cred.username)}.`,
         `${pc.yellow("○")} No projects connected — nothing is being collected.`,
         "",
-        pc.dim("Choose Connect a project below to start."),
+        pc.dim(
+          globalTrackingOn()
+            ? "Choose Connect a project below to start."
+            : "Track everything, or connect one project — both are below."
+        ),
       ].join("\n"),
       "where you are"
     );

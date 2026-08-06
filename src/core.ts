@@ -764,6 +764,50 @@ export function writeGlobalSettings(origin: string, token: string): string {
     recursive: true,
     mode: 0o700,
   });
+
+  /* Refuse a symlink rather than following or replacing it. The atomic rename
+     would swap the link for a regular file — the token never reaches the link
+     target, so nothing leaks into a dotfiles repository, but the person's
+     symlink is silently gone and their real settings stop applying. People who
+     symlink this file did it deliberately. */
+  let existing: fs.Stats | null = null;
+  try {
+    existing = fs.lstatSync(GLOBAL_SETTINGS_FILE);
+  } catch {
+    existing = null;
+  }
+  if (existing?.isSymbolicLink()) {
+    throw new Error(
+      `${GLOBAL_SETTINGS_FILE} is a symlink; vibecom will not replace it. ` +
+        `Point it at a real file, or link a single project instead.`
+    );
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error(`${GLOBAL_SETTINGS_FILE} is not a regular file`);
+  }
+
+  /* A settings file that exists but does not parse must not be treated as an
+     empty object: merging into {} and writing means silently replacing
+     whatever was there. One stray comma in a person's Claude Code config
+     would cost them every permission and hook they had set. Stop, and say
+     which file to fix. */
+  if (existing) {
+    const raw = fs.readFileSync(GLOBAL_SETTINGS_FILE, "utf8");
+    if (raw.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("not a JSON object");
+        }
+      } catch {
+        throw new Error(
+          `${GLOBAL_SETTINGS_FILE} is not valid JSON. Fix or move it first — ` +
+            `vibecom will not overwrite settings it cannot read.`
+        );
+      }
+    }
+  }
+
   const data = readJson<Record<string, unknown>>(GLOBAL_SETTINGS_FILE, {});
   const env = (
     typeof data.env === "object" && data.env !== null ? data.env : {}
@@ -784,6 +828,25 @@ export function writeGlobalSettings(origin: string, token: string): string {
      token, so it still gets 0600. */
   writePrivateFile(GLOBAL_SETTINGS_FILE, JSON.stringify(data, null, 2) + "\n");
   return GLOBAL_SETTINGS_FILE;
+}
+
+/**
+ * The ingest token behind whole-machine tracking.
+ *
+ * Per-project scans read the token out of the repository's settings file.
+ * The global slot has no repository, so without this the scan finds no token,
+ * sends nothing, and reports success — historical import silently does
+ * nothing while live telemetry keeps working, which is the hardest kind of
+ * bug to notice.
+ */
+export function readGlobalToken(): string | null {
+  const data = readJson<{ env?: Record<string, string> }>(
+    GLOBAL_SETTINGS_FILE,
+    {}
+  );
+  const header = data.env?.OTEL_EXPORTER_OTLP_HEADERS ?? "";
+  const match = /Authorization=Bearer\s+(\S+)/.exec(header);
+  return match?.[1] ?? null;
 }
 
 /** Whether whole-machine tracking is currently configured. */

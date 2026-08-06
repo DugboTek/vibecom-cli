@@ -104,3 +104,38 @@ test("today missing does not break a streak, yesterday missing does", () => {
   assert.equal(streakFrom(["2026-08-04"], today), 0);
   assert.equal(streakFrom([], today), 0);
 });
+
+test("the machine-wide slot is the fallback owner of any session", () => {
+  /* Slot matching compares real directory paths, and the machine-wide slot's
+     root is "*", so it can never win one. Without an explicit fallback every
+     session landed in "unlinked projects — ignored": live telemetry kept
+     flowing while historical import silently did nothing, and the rank card
+     showed zero. A specific project must still win when one matches, so mixed
+     setups keep their per-project tiers. */
+  const GLOBAL = "*";
+  const slots = [
+    { root: "/code/app", label: "app" },
+    { root: GLOBAL, label: "everything" },
+  ];
+  const pick = (root: string | null) =>
+    (root ? slots.find((s) => s.root === root) : undefined) ??
+    slots.find((s) => s.root === GLOBAL);
+
+  assert.equal(pick("/code/app")?.label, "app", "a real project still wins");
+  assert.equal(
+    pick("/code/never-linked")?.label,
+    "everything",
+    "an unlinked project falls back to machine-wide tracking"
+  );
+  assert.equal(pick(null)?.label, "everything", "no cwd still resolves");
+
+  const onlyProjects = slots.slice(0, 1);
+  const pickNoGlobal = (root: string | null) =>
+    (root ? onlyProjects.find((s) => s.root === root) : undefined) ??
+    onlyProjects.find((s) => s.root === GLOBAL);
+  assert.equal(
+    pickNoGlobal("/code/other"),
+    undefined,
+    "without machine-wide tracking an unlinked project is still skipped"
+  );
+});
