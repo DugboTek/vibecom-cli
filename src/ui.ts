@@ -73,6 +73,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * to one static frame when the terminal is narrow or animation is off.
  */
 export async function banner(subtitle: string): Promise<void> {
+  /* The installer draws the wordmark, then hands the terminal straight to the
+     CLI, which drew it again — two identical logos a few lines apart in what
+     is meant to read as one flow. The second one signals "a new thing is
+     starting" at the exact moment we want to signal "this is still the same
+     setup, continuing". The installer sets this so the handoff stays quiet. */
+  if (process.env.VIBECOM_BANNER_ALREADY_SHOWN === "1") {
+    delete process.env.VIBECOM_BANNER_ALREADY_SHOWN;
+    return;
+  }
+
   const width = process.stdout.columns ?? 80;
   const wide = width >= 66;
 

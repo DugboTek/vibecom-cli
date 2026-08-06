@@ -41,7 +41,8 @@ REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "public" / "cli.js"
 
 
-def build_sandbox(tmp: Path, signed_in: bool, origin: str, foreign: bool = False) -> Path:
+def build_sandbox(tmp: Path, signed_in: bool, origin: str, foreign: bool = False,
+                  linked: bool = False) -> Path:
     """A throwaway HOME so a walkthrough can never touch the real config."""
     (tmp / ".config" / "vibecom").mkdir(parents=True, exist_ok=True)
     os.chmod(tmp / ".config" / "vibecom", 0o700)
@@ -62,6 +63,19 @@ def build_sandbox(tmp: Path, signed_in: bool, origin: str, foreign: bool = False
             ["git", "remote", "add", "origin",
              "https://github.com/some-employer/internal-service.git"],
             cwd=demo, check=True,
+        )
+
+    if linked:
+        # A project already connected, so the "you're live" state can be seen
+        # without a working server or a real sign-in.
+        import hashlib
+        slots = tmp / ".config" / "vibecom" / "projects"
+        slots.mkdir(parents=True, exist_ok=True)
+        root = str(demo)
+        (slots / (hashlib.sha256(root.encode()).hexdigest() + ".json")).write_text(
+            '{"root":"%s","salt":"abc","projectId":"pid","tier":1,'
+            '"label":"demo-app","origin":"%s","linkedAt":"2026-08-05T00:00:00Z"}'
+            % (root, origin)
         )
 
     if signed_in:
@@ -126,6 +140,8 @@ def main():
     ap.add_argument("--keys", default="\r", help="keystrokes, one per prompt")
     ap.add_argument("--args", nargs="*", default=[])
     ap.add_argument("--signed-out", action="store_true")
+    ap.add_argument("--linked", action="store_true",
+                    help="pretend a project is already connected")
     ap.add_argument("--foreign-remote", action="store_true",
                     help="make the demo repo look owned by someone else")
     # The canonical host. vibecom.build 308s to www, and credentials do not
@@ -140,7 +156,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="vibecom-walkthrough-"))
     try:
         demo = build_sandbox(tmp, not opts.signed_out, opts.origin,
-                             foreign=opts.foreign_remote)
+                             foreign=opts.foreign_remote,
+                             linked=opts.linked)
         env = {
             **os.environ,
             "HOME": str(tmp),

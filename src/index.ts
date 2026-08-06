@@ -831,16 +831,34 @@ function slotChoices(slots: ProjectSlot[]) {
 
 async function menu(cred: Credentials): Promise<boolean> {
   const slots = listSlots();
+  const ready = slots.length > 0;
   const action = orExit(
     await p.select({
-      message: "What next?",
+      /* The prompt used to be "What next?" with an action preselected, which
+         asks a finished person to pick more work and makes leaving look like
+         abandoning something. When projects are connected there is nothing
+         left to do, so say so and default to Done — the highlighted row is the
+         strongest signifier on the screen and it should point at the intended
+         end of the flow, not away from it. */
+      message: ready
+        ? "Nothing else is needed. Anything you want to change?"
+        : "What next?",
+      initialValue: ready ? "done" : "link",
       options: [
+        ...(ready
+          ? [
+              {
+                value: "done" as const,
+                label: `${pc.green("Done")} ${pc.dim("— start building")}`,
+              },
+            ]
+          : []),
         {
           value: "link",
           // "more" is a claim about state. Offering it with nothing linked —
           // which is exactly what a failed first run leaves behind — tells the
           // person something was connected when nothing was.
-          label: slots.length > 0 ? "Connect more projects" : "Connect a project",
+          label: ready ? "Connect more projects" : "Connect a project",
         },
         {
           value: "tier",
@@ -855,7 +873,9 @@ async function menu(cred: Credentials): Promise<boolean> {
         { value: "preview", label: "See exactly what gets sent" },
         { value: "unlink", label: "Stop collecting from a project" },
         { value: "logout", label: pc.dim("Sign out") },
-        { value: "done", label: pc.dim("Done") },
+        // Done is promoted to the top once there is nothing left to set up, so
+        // it only belongs down here while setup is still incomplete.
+        ...(ready ? [] : [{ value: "done", label: pc.dim("Done") }]),
       ].filter(
         (o) =>
           slots.length > 0 ||
@@ -947,6 +967,63 @@ async function menu(cred: Credentials): Promise<boolean> {
   }
 }
 
+/**
+ * Say what is true right now, before offering anything to change.
+ *
+ * Answers the three questions a person arrives at this screen holding: am I
+ * set up, what is being collected, and where does it show up. Each line is a
+ * fact with a visible marker, so the state is readable at a glance rather
+ * than inferred from which menu items happen to be present.
+ */
+function showState(cred: Credentials) {
+  const slots = listSlots();
+  const tools = transcriptSources()
+    .filter((source) => source.files.length > 0)
+    .map((source) =>
+      source.tool === "claude-code"
+        ? "Claude Code"
+        : source.tool === "codex"
+          ? "Codex"
+          : "Kimi"
+    );
+  const worktrees = slots.reduce(
+    (total, slot) => total + Math.max(0, listWorktrees(slot.root).length - 1),
+    0
+  );
+
+  if (slots.length === 0) {
+    p.note(
+      [
+        `${pc.yellow("○")} Signed in as ${pc.bold(cred.username)}.`,
+        `${pc.yellow("○")} No projects connected — nothing is being collected.`,
+        "",
+        pc.dim("Choose Connect a project below to start."),
+      ].join("\n"),
+      "where you are"
+    );
+    return;
+  }
+
+  p.note(
+    [
+      `${pc.green("✔")} Signed in as ${pc.bold(cred.username)}`,
+      `${pc.green("✔")} Collecting from ${pc.bold(
+        `${slots.length} project${slots.length === 1 ? "" : "s"}`
+      )}${worktrees > 0 ? pc.dim(`  +${worktrees} worktree${worktrees === 1 ? "" : "s"}`) : ""}`,
+      ...slots.map((slot) => `    ${pc.dim("·")} ${slot.label}`),
+      tools.length > 0
+        ? `${pc.green("✔")} Reading ${pc.bold(tools.join(" + "))}`
+        : `${pc.yellow("○")} No coding sessions found yet — new ones will count`,
+      "",
+      `${pc.bold("You're set up.")} Just code — activity uploads on its own.`,
+      pc.dim(`Your profile: ${cred.origin}/u/${cred.username}`),
+      "",
+      pc.dim("Nothing else is required. Choose Done to exit."),
+    ].join("\n"),
+    pc.green("you're live")
+  );
+}
+
 /** `vibecom` with no arguments: sign in if needed, connect, then stay open. */
 async function wizard() {
   await banner("the community for AI builders");
@@ -973,6 +1050,13 @@ async function wizard() {
     const here = projectRoot();
     await quickStart(cred, here ? path.dirname(here) : process.cwd());
   }
+
+  /* Setup used to end by dropping straight into "What next?" with an action
+     preselected. Nothing said the work had finished, nothing said what was now
+     true, and the highlighted row proposed more work — so a person who was
+     actually done had no way to tell that they were. State the outcome before
+     offering the menu. */
+  showState(cred);
 
   while (await menu(cred));
   p.outro(
