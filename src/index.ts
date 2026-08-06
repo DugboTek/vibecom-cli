@@ -76,6 +76,7 @@ import {
 } from "./transcripts";
 import { collectRepoStats } from "./gitStats";
 import { playReel, reelFrames } from "./reel";
+import { runDemo } from "./demo";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
    their own, so only bare console.log lines need one from us. */
 import {
@@ -1584,6 +1585,7 @@ async function help() {
     ["preview", "show exactly what leaves this repo"],
     ["status", "linked projects and trusted owners"],
     ["doctor", "check tracking really works, end to end"],
+    ["demo", "play the onboarding as a simulation, changing nothing"],
     ["sync", "cover worktrees created since linking"],
     ["scan", "import usage from running + past sessions"],
     ["rescan", "re-import everything, correcting old timestamps"],
@@ -1760,6 +1762,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.log.success("signed out");
     p.log.warn("linked projects keep their own tokens — unlink them or revoke at /settings");
   },
+  demo: () => runDemo(),
   doctor: () => doctor(),
   reel: async (args: string[]) => {
     if (args.includes("--frames")) {
