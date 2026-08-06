@@ -5,16 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 
-import {
-  collectRepoStats,
-  gitIdentities,
-  isGeneratedPath,
-  parseGitLog,
-  PER_COMMIT_LINE_CAP,
-  PER_FILE_LINE_CAP,
-  pullRequestRef,
-  renameDestination,
-} from "./gitStats";
+import { PER_COMMIT_LINE_CAP, PER_FILE_LINE_CAP, aggregateUncoveredRepos, collectRepoStats, emptyRepoStats, gitIdentities, isGeneratedPath, parseGitLog, pullRequestRef, renameDestination, type RepoStats } from "./gitStats";
 
 /* realpath because macOS symlinks /tmp to /private/tmp and git reports the
    resolved path back. */
@@ -598,4 +589,66 @@ test("no repository content survives collection", () => {
     !/[A-Za-z]{4}/.test(serialised.replace(/"[a-zA-Z]+":/g, "")),
     "nothing but field names and numbers may appear"
   );
+});
+
+/* ------- machine-wide aggregation ------- */
+
+const stats = (over: Partial<RepoStats> = {}): RepoStats => ({
+  ...emptyRepoStats(),
+  commits: 1,
+  linesAdded: 10,
+  linesRemoved: 2,
+  prs: 1,
+  excludedLines: 3,
+  ...over,
+});
+
+test("a repository with its own slot is never counted twice", () => {
+  const asked: string[] = [];
+  const { total, counted } = aggregateUncoveredRepos(
+    ["/repo/linked", "/repo/loose"],
+    new Set(["/repo/linked"]),
+    (root) => {
+      asked.push(root);
+      return stats();
+    }
+  );
+  assert.deepEqual(asked, ["/repo/loose"], "a covered repo is not even read");
+  assert.equal(counted, 1);
+  assert.equal(
+    total.commits,
+    1,
+    "counting the linked repo here would double it against its own project id"
+  );
+});
+
+test("repositories are summed into one total, not returned separately", () => {
+  const { total, counted } = aggregateUncoveredRepos(
+    ["/a", "/b", "/c"],
+    new Set(),
+    () => stats()
+  );
+  assert.equal(counted, 3);
+  assert.deepEqual(
+    total,
+    { commits: 3, linesAdded: 30, linesRemoved: 6, prs: 3, excludedLines: 9 },
+    "one snapshot scope means one record, or they replace each other"
+  );
+});
+
+test("an unreadable repository contributes nothing and is not counted", () => {
+  const { total, counted } = aggregateUncoveredRepos(
+    ["/gone", "/real"],
+    new Set(),
+    (root) => (root === "/gone" ? null : stats())
+  );
+  assert.equal(counted, 1, "null is 'could not read', not 'did no work'");
+  assert.equal(total.commits, 1);
+});
+
+test("nothing to count reports zero, so no empty snapshot is sent", () => {
+  const { counted } = aggregateUncoveredRepos(["/x"], new Set(["/x"]), () =>
+    stats()
+  );
+  assert.equal(counted, 0, "an empty total would overwrite real counts with 0");
 });

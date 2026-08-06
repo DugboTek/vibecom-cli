@@ -36,6 +36,46 @@ export const emptyRepoStats = (): RepoStats => ({
 });
 
 /**
+ * Sum counters across repositories that no per-project slot already covers.
+ *
+ * Serves the machine-wide slot, which is not a directory and so has no
+ * repository of its own to read. Both halves are load-bearing:
+ *
+ * `covered` is subtracted because the server aggregates `GROUP BY (userId,
+ * metricType)`. A repository reporting under both its own project id and the
+ * machine-wide one has every commit counted twice, and nothing downstream can
+ * tell the copies apart afterwards.
+ *
+ * The result is one total rather than a list because each repository record is
+ * a snapshot that replaces its `(projectId, source)` scope. Under a single
+ * token every record shares one scope, so sending them separately has them
+ * delete one another and leaves only whichever arrived last.
+ */
+export function aggregateUncoveredRepos(
+  roots: Iterable<string>,
+  covered: ReadonlySet<string>,
+  collect: (root: string) => RepoStats | null
+): { total: RepoStats; counted: number } {
+  const total = emptyRepoStats();
+  let counted = 0;
+  for (const root of roots) {
+    if (covered.has(root)) continue;
+    const stats = collect(root);
+    /* Null is "could not read", never "did no work" — not a repository, git
+       missing, or no commits yet. Folding a zero in would be the same lie the
+       per-project path already refuses to tell. */
+    if (!stats) continue;
+    total.commits += stats.commits;
+    total.linesAdded += stats.linesAdded;
+    total.linesRemoved += stats.linesRemoved;
+    total.prs += stats.prs;
+    total.excludedLines += stats.excludedLines;
+    counted += 1;
+  }
+  return { total, counted };
+}
+
+/**
  * Paths whose churn is machine-generated rather than written.
  *
  * How much this catches varies enormously by project: measured across 19 real

@@ -74,7 +74,7 @@ import {
   transcriptSources,
   type SessionUsage,
 } from "./transcripts";
-import { collectRepoStats } from "./gitStats";
+import { aggregateUncoveredRepos, collectRepoStats } from "./gitStats";
 import { playReel, reelFrames } from "./reel";
 import { runDemo } from "./demo";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
@@ -773,6 +773,10 @@ async function runScan(
   const byProject = new Map<string, { usage: SessionUsage; key: string }[]>();
   let skipped = 0;
   const byTool: Record<string, number> = {};
+  /* Every repository a session actually ran in, whether or not it is linked.
+     The machine-wide slot has no directory of its own, so this is the only
+     record of which repositories exist to read git counters from. */
+  const seenRoots = new Set<string>();
 
   for (const usage of grouped) {
     const key = `${usage.tool}:${usage.sessionId}`;
@@ -792,6 +796,7 @@ async function runScan(
     if (!usage.model && mark?.model) usage.model = mark.model;
     const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
     const root = cwd ? projectRoot(cwd) : null;
+    if (root) seenRoots.add(root);
     /* The machine-wide slot has no directory of its own, so it can never win
        a path comparison. Without it as the fallback every session lands in
        "unlinked projects — ignored" and the import quietly does nothing while
@@ -892,7 +897,7 @@ async function runScan(
      sessions. Commits land without a transcript all the time — a rebase, a
      merge, work done outside any AI tool — so gating this on transcript
      activity would leave the counters permanently stale. */
-  const repos = await sendGitStats(slots, failed);
+  const repos = await sendGitStats(slots, failed, seenRoots);
 
   return {
     sent,
@@ -915,12 +920,67 @@ async function runScan(
  * server replaces the previous copy instead of adding to it, so a corrected
  * count converges rather than compounding.
  */
-async function sendGitStats(
-  slots: ProjectSlot[],
+/**
+ * Read git counters for the machine-wide slot.
+ *
+ * `*` is not a directory, so the per-project path cannot serve it: there is no
+ * settings file to read a token from and no repository to count. Left alone,
+ * anyone who took the default onboarding got tokens and cost but never a
+ * single commit, line or pull request — the craft half of every profile was
+ * silently zero.
+ *
+ * Two constraints shape this. Repositories that carry their own slot are
+ * excluded, because the server sums `GROUP BY (userId, metricType)` and a
+ * repository counted under both its own project id and the machine-wide one
+ * would double every commit it contains. And what remains is summed into a
+ * single record rather than sent per repository, because each record is a
+ * snapshot that replaces its `(projectId, source)` scope — sending five under
+ * one token would have them delete each other, leaving whichever landed last.
+ * One bucket, one total, which is what "all projects" already means everywhere
+ * else.
+ */
+async function sendGlobalGitStats(
+  slot: ProjectSlot,
+  covered: Set<string>,
+  roots: Set<string>,
   failed: Set<string>
 ): Promise<number> {
+  const token = readGlobalToken();
+  if (!token) return 0;
+
+  const { total, counted } = aggregateUncoveredRepos(roots, covered, (root) =>
+    collectRepoStats(root, null)
+  );
+  if (counted === 0) return 0;
+
+  try {
+    await sendRepoStats(slot.origin, token, [total]);
+    return 1;
+  } catch (e) {
+    failed.add(`all projects: ${e instanceof Error ? e.message : e}`);
+    return 0;
+  }
+}
+
+async function sendGitStats(
+  slots: ProjectSlot[],
+  failed: Set<string>,
+  seenRoots: Set<string> = new Set()
+): Promise<number> {
   let sent = 0;
-  for (const slot of slots) {
+  const globalSlot = slots.find((s) => s.root === GLOBAL_SLOT_ROOT);
+  const projectSlots = slots.filter((s) => s.root !== GLOBAL_SLOT_ROOT);
+
+  if (globalSlot) {
+    sent += await sendGlobalGitStats(
+      globalSlot,
+      new Set(projectSlots.map((s) => s.root)),
+      seenRoots,
+      failed
+    );
+  }
+
+  for (const slot of projectSlots) {
     const token = readProjectToken(slot.root);
     if (!token) continue;
 
