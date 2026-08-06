@@ -177,7 +177,49 @@ async function runLogin(origin: string): Promise<Credentials> {
     origin,
   };
   writeCredentials(cred);
+  await repairOriginDrift(cred);
   return cred;
+}
+
+/**
+ * Re-point tracking at the host you just signed in to.
+ *
+ * Signing in writes a credential and nothing else, but the exporter endpoint
+ * and its bearer token live in settings files written at link time. After a
+ * host change those still name the old one, so every upload leaves for an
+ * address the new account does not own — and the local checks all pass, because
+ * locally everything agrees with itself.
+ *
+ * Worse, there was no way back: the menu offers whole-machine tracking only
+ * while it is off, so a machine already tracking the wrong host had no route to
+ * the right one. Doing it here means the fix is the command that doctor already
+ * tells people to run.
+ */
+async function repairOriginDrift(cred: Credentials): Promise<void> {
+  const stale = listSlots().filter((slot) => slot.origin !== cred.origin);
+  if (stale.length === 0) return;
+
+  const globalSlot = stale.find((slot) => slot.root === GLOBAL_SLOT_ROOT);
+  if (globalSlot) {
+    p.log.step(
+      `moving tracking from ${pc.dim(globalSlot.origin)} to ${pc.cyan(cred.origin)}`
+    );
+    /* Revoke first: the old token stays valid on the old host otherwise, and
+       a bearer token nobody is watching is worth nothing to keep. */
+    await revokeProjectToken(globalSlot.origin, cred.token, globalSlot.projectId)
+      .catch(() => undefined);
+    deleteSlot(GLOBAL_SLOT_ROOT);
+    removeGlobalSettings();
+    await linkGlobal(cred, cred.origin);
+  }
+
+  const projects = stale.filter((slot) => slot.root !== GLOBAL_SLOT_ROOT);
+  for (const slot of projects) {
+    p.log.warn(
+      `${pc.bold(slot.label)} still reports to ${pc.dim(slot.origin)} — ` +
+        `choose "Stop collecting from a project" to drop it`
+    );
+  }
 }
 
 /** Sign in if needed; otherwise return the stored credentials untouched. */
@@ -1430,7 +1472,8 @@ async function doctor() {
         false,
         "",
         `still reporting to ${pc.cyan(slotOrigin)}, which is not ${pc.cyan(CANONICAL_ORIGIN)}`,
-        `VIBECOM_ORIGIN=${CANONICAL_ORIGIN} vibecom login`
+        `VIBECOM_ORIGIN=${CANONICAL_ORIGIN} vibecom login` +
+          pc.dim("   (re-points tracking at the same time)")
       );
     } else {
       say(true, `reporting to ${pc.cyan(slotOrigin)}`, "");
