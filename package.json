@@ -1,6 +1,6 @@
 {
   "name": "vibecom-cli",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "The vibecom CLI — reads coding-session counters off disk and sends only what COLLECTION.md documents.",
   "license": "MIT",
   "bin": {
