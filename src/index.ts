@@ -75,6 +75,7 @@ import {
   type SessionUsage,
 } from "./transcripts";
 import { collectRepoStats } from "./gitStats";
+import { playReel, reelFrames } from "./reel";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
    their own, so only bare console.log lines need one from us. */
 import {
@@ -572,7 +573,12 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
   const count = 1;
   void searchDir;
 
-  const scan = await pulse("importing your existing activity", runScan());
+  /* The reel covers the scan, which is real waiting — thousands of transcripts
+     off disk and a round trip per batch. Both run together, so the story costs
+     nothing and the wait stops feeling like one. */
+  const scanning = runScan();
+  await playReel();
+  const scan = await pulse("importing your existing activity", scanning);
   for (const failure of scan.failed) p.log.warn(failure);
   if (scan.tokens > 0) {
     p.note(
@@ -934,12 +940,16 @@ async function menu(cred: Credentials): Promise<boolean> {
          left to do, so say so and default to Done — the highlighted row is the
          strongest signifier on the screen and it should point at the intended
          end of the flow, not away from it. */
-      message: ready
-        ? "Nothing else is needed. Anything you want to change?"
-        : "What next?",
-      initialValue: ready ? "done" : "link",
+      /* "Nothing else is needed" is only true once the machine is covered.
+         While it is not, the useful default is the thing that covers it. */
+      message: !globalTrackingOn()
+        ? "Want everything on this computer counted?"
+        : ready
+          ? "Nothing else is needed. Anything you want to change?"
+          : "What next?",
+      initialValue: !globalTrackingOn() ? "global" : ready ? "done" : "link",
       options: [
-        ...(ready
+        ...(ready && globalTrackingOn()
           ? [
               {
                 value: "done" as const,
@@ -982,7 +992,9 @@ async function menu(cred: Credentials): Promise<boolean> {
         { value: "logout", label: pc.dim("Sign out") },
         // Done is promoted to the top once there is nothing left to set up, so
         // it only belongs down here while setup is still incomplete.
-        ...(ready ? [] : [{ value: "done", label: pc.dim("Done") }]),
+        ...(ready && globalTrackingOn()
+          ? []
+          : [{ value: "done", label: pc.dim("Done") }]),
       ].filter(
         (o) =>
           slots.length > 0 ||
@@ -1195,10 +1207,26 @@ function showState(cred: Credentials) {
         ? `${pc.green("✔")} Reading ${pc.bold(tools.join(" + "))}`
         : `${pc.yellow("○")} No coding sessions found yet — new ones will count`,
       "",
-      `${pc.bold("You're set up.")} Just code — activity uploads on its own.`,
-      pc.dim(`Your profile: ${cred.origin}/u/${cred.username}`),
-      "",
-      pc.dim("Nothing else is required. Choose Done to exit."),
+      /* Claiming "set up" while only some projects are covered is the same
+         mistake as the old "Found supported session files": the screen states
+         a completeness the configuration does not have, and the person has no
+         reason to look for the option that would fix it. */
+      ...(globalTrackingOn()
+        ? [
+            `${pc.bold("You're set up.")} Just code — activity uploads on its own.`,
+            pc.dim(`Your profile: ${cred.origin}/u/${cred.username}`),
+            "",
+            pc.dim("Nothing else is required. Choose Done to exit."),
+          ]
+        : [
+            `${pc.yellow("Only these projects count.")} Anything you build`,
+            `elsewhere on this computer is ${pc.bold("not")} being tracked.`,
+            pc.dim(`Your profile: ${cred.origin}/u/${cred.username}`),
+            "",
+            `${pc.bold("Track every project on this computer")} ${pc.dim(
+              "— first option below"
+            )}`,
+          ]),
     ].join("\n"),
     pc.green("you're live")
   );
@@ -1692,6 +1720,13 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     p.log.warn("linked projects keep their own tokens — unlink them or revoke at /settings");
   },
   doctor: () => doctor(),
+  reel: async (args: string[]) => {
+    if (args.includes("--frames")) {
+      for (const frame of reelFrames()) console.log(frame + "\n");
+      return;
+    }
+    await playReel();
+  },
   help: () => help(),
 };
 
