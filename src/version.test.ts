@@ -98,3 +98,26 @@ test("an unbuilt checkout reports a version that cannot pass for a release", () 
     assert.ok(parseVersion(VERSION), "a built binary carries a real version");
   }
 });
+
+test("a real built bundle carries a readable version", () => {
+  /* The downgrade guard in selfUpdate only runs when it can read both
+     versions; a null means "cannot compare" and it installs regardless. For
+     every published build the bundle's only literal version lived in a
+     minified `var Z="1.0.0"`, which this pattern does not match, so the guard
+     was never actually protecting anyone. Build the real artefact and read it
+     back the way selfUpdate does. */
+  const bundle = path.join(process.cwd(), "public", "cli.js");
+  if (!fs.existsSync(bundle)) return; // nothing built in this checkout
+  const source = fs.readFileSync(bundle, "utf8");
+  assert.ok(
+    source.startsWith("#!/usr/bin/env node"),
+    "the shebang must stay on the first line or the installer cannot exec it"
+  );
+  const found = versionFromBundle(source);
+  assert.ok(
+    found,
+    "versionFromBundle returned null for a real build — the downgrade guard " +
+      "in selfUpdate is disabled whenever this happens"
+  );
+  assert.match(found, /^\d+\.\d+\.\d+/);
+});

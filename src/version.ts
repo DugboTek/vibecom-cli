@@ -76,9 +76,13 @@ export function bumpKind(
 /**
  * Read the version out of a built bundle.
  *
- * esbuild inlines the define as a string literal, so the published artefact
- * carries its own version in a form that can be read back without running it —
- * which is what lets an update check compare before overwriting anything.
+ * The comment the build writes under the shebang is the only readable copy.
+ * The define is inlined into an expression that minifies to `var Z="1.0.0"`,
+ * and `vibecom ${VERSION}` becomes a runtime concatenation — so for a long
+ * while this returned null for every published bundle. `selfUpdate` treats a
+ * null as "cannot compare" and installs anyway, which quietly disabled the
+ * downgrade protection it exists to provide. Keep the banner and this pattern
+ * in step; the test in version.test.ts asserts a real build satisfies it.
  */
 export function versionFromBundle(source: string): string | null {
   const marker = source.match(/vibecom (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/);

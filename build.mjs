@@ -33,7 +33,15 @@ await build({
     __VIBECOM_BUILD__: JSON.stringify(stamp),
     __VIBECOM_VERSION__: JSON.stringify(version),
   },
-  banner: { js: "#!/usr/bin/env node" },
+  /* The version must survive minification as a literal, greppable string.
+     esbuild turns `vibecom ${VERSION}` into a runtime concatenation, so the
+     bundle contained no readable version at all and `versionFromBundle` always
+     returned null — which silently disabled the downgrade guard in
+     `selfUpdate`, the one thing standing between users and a host serving an
+     older CLI. A banner comment is not minified away. */
+  banner: {
+    js: `#!/usr/bin/env node\n// vibecom ${version} build ${stamp}`,
+  },
   legalComments: "none",
 });
 
