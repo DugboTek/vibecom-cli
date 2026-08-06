@@ -12,7 +12,13 @@ import { after, test } from "node:test";
    os.homedir() at import time, so each case runs in a child process with HOME
    pointed at a fixture. */
 
-const root = process.cwd();
+/* Resolved from this file, not from process.cwd(). Deriving it from the
+   working directory meant the suite only passed when it was started from the
+   repository root: run from `cli/` — which is what `cli/package.json`'s own
+   test script does, and what the release workflow runs before publishing —
+   the path became `cli/cli/src/core.ts`, every case failed to import, and the
+   CLI silently stopped being released. */
+const coreModule = path.resolve(__dirname, "core.ts");
 const tmp = fs.realpathSync(
   fs.mkdtempSync(path.join(os.tmpdir(), "vibecom-global-test-"))
 );
@@ -26,7 +32,7 @@ function inHome(setup: (home: string) => void, body: string): string {
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
   setup(home);
   const script = `
-    const core = await import(${JSON.stringify(path.join(root, "cli/src/core.ts"))});
+    const core = await import(${JSON.stringify(coreModule)});
     const fs = await import("node:fs");
     const settings = ${JSON.stringify(path.join(home, ".claude", "settings.json"))};
     ${body}
@@ -38,7 +44,7 @@ function inHome(setup: (home: string) => void, body: string): string {
   return execFileSync(process.execPath, ["--import", "tsx", runner], {
     env: { ...process.env, HOME: home },
     encoding: "utf8",
-    cwd: root,
+    cwd: path.dirname(coreModule),
   });
 }
 
