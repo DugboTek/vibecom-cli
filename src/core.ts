@@ -1594,8 +1594,16 @@ export type LinkResult = {
  * unbounded cost for no benefit. Re-sending a session that turns out to
  * still belong to the global bucket is a no-op: snapshot replacement is
  * idempotent.
+ *
+ * `linkRepo` calls this on every successful link, so nothing else needs to.
+ * Exported anyway for a link path that does not go through `linkRepo` —
+ * today that is the interactive wizard's `applyLinks` in `index.ts`, which
+ * duplicates `linkRepo`'s sequence rather than calling it (see spec §1.7:
+ * that duplication is meant to be refactored away; until it is, this must be
+ * called after `applyLinks` writes a slot, or wizard-established links keep
+ * whatever their scan marks said before the link existed).
  */
-function invalidateGlobalScanMarks(): void {
+export function invalidateGlobalScanMarks(): void {
   const marks = readScanMarks();
   let changed = false;
   for (const key of Object.keys(marks)) {
