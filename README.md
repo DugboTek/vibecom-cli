@@ -207,6 +207,18 @@ the most useful file to read if you want to know exactly what is pulled off disk
 | Kimi | `~/.kimi/**/wire.jsonl` |
 | OpenCode | OTLP export |
 
+### Historical Claude Code activity
+
+`vibecom rescan` can import only the Claude Code transcripts that are still on
+your machine. It does not fetch conversation history from your Anthropic
+account, and it cannot include Claude web or desktop activity.
+
+Claude Code keeps its local transcripts in `~/.claude/projects/` for 30 days by
+default (configurable through Claude Code's `cleanupPeriodDays` setting). If
+older transcripts were pruned, moved during a migration, or live only in an old
+machine or backup, their activity cannot be backfilled until that archive is
+available locally. See [Anthropic's data-retention documentation](https://code.claude.com/docs/en/data-usage).
+
 ---
 
 ## Stopping

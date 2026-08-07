@@ -193,6 +193,15 @@ Use it to backfill the duration-aware clock for old history. Imports made before
 session event times existed were stamped only at their upload or end time, so
 hours of work could appear as a single busy spike.
 
+### Claude Code history is local
+
+A rescan reads only the Claude Code transcript files currently present at
+`~/.claude/projects/`; it never retrieves account history from Anthropic. Claude
+Code retains those local files for 30 days by default via `cleanupPeriodDays`, so
+an old period can be backfilled only if its files remain on disk or are restored
+from an older machine or backup. Claude web and desktop activity are outside the
+CLI's collection scope. See [Anthropic's data-retention documentation](https://code.claude.com/docs/en/data-usage).
+
 ## Consent tiers
 
 `vibecom link --tier N` binds a tier to that project's token. The tier is stored
