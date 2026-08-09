@@ -80,6 +80,12 @@ import {
   transcriptSources,
   type SessionUsage,
 } from "./transcripts";
+import { hostedSessionUsages } from "./hostSessions";
+import { runCodexAppServerProxy } from "./appServerBridge";
+import {
+  installSuperconductorCodexBridge,
+  superconductorBridgeInstalled,
+} from "./superconductor";
 import { aggregateUncoveredRepos, collectRepoStats } from "./gitStats";
 import {
   DEFAULT_AUTOPILOT,
@@ -94,6 +100,9 @@ import {
   removeSessionHook,
   runAutopilot,
   scanDue,
+  installScanAgent,
+  removeScanAgent,
+  scanAgentInstalled,
   sessionHookInstalled,
   uncoveredEverywhere,
   writeAutopilot,
@@ -751,6 +760,13 @@ async function runScan(
   tokens: number;
   days: string[];
 }> {
+  /* Superconductor regenerates its provider wrappers during some app updates.
+     Autopilot is explicit consent for this bridge, so repair the narrow Codex
+     hook before a scheduled scan instead of quietly losing a new app-server
+     session after an otherwise harmless host update. */
+  if (readAutopilot().enabled && !superconductorBridgeInstalled()) {
+    installSuperconductorCodexBridge(hookBinary());
+  }
   const slots = listSlots();
   if (slots.length === 0)
     return {
@@ -800,6 +816,11 @@ async function runScan(
 
       parsed.push(usage);
   }
+
+  /* Desktop hosts such as Conductor own their agent conversations rather than
+     writing the provider's ordinary archive. Their adapters return only safe
+     metadata, so a Codex/Claude session counts whichever app launched it. */
+  parsed.push(...hostedSessionUsages());
 
   /* Claude resumes replay records with stable message ids, while Claude/Kimi
      child agents write separate wires that are real additional work. The
@@ -1786,11 +1807,19 @@ function prevailingTier(): 1 | 2 | 3 {
 
 function reportAutopilot(config: AutopilotConfig) {
   const installed = sessionHookInstalled();
-  const live = config.enabled && installed;
+  const collectorInstalled = scanAgentInstalled();
+  const superconductorInstalled = superconductorBridgeInstalled();
+  const live = config.enabled && installed && (!config.scan || collectorInstalled);
   console.log(bullet((live ? plus : minus)(`autopilot ${live ? "on" : "off"}`)));
   if (config.enabled && !installed) {
     p.log.warn(
       `enabled, but no session hook in ${claudeSettingsPath()} — run ${pc.bold("vibecom autopilot on")}`
+    );
+  }
+  if (config.enabled && config.scan && !collectorInstalled) {
+    p.log.warn(
+      "enabled, but the all-provider collector is missing — run " +
+        pc.bold("vibecom autopilot on")
     );
   }
   console.log(
@@ -1800,6 +1829,9 @@ function reportAutopilot(config: AutopilotConfig) {
       )
     )
   );
+  if (superconductorInstalled) {
+    console.log(bullet(pc.dim("   Superconductor Codex app-server  counter bridge on")));
+  }
   console.log(
     bullet(
       pc.dim(
@@ -1814,9 +1846,9 @@ function reportAutopilot(config: AutopilotConfig) {
   console.log(
     bullet(
       pc.dim(
-        `   Codex, Kimi and git counters  ${
-          config.enabled && config.scan
-            ? `scanned in the background, at most every ${config.scanIntervalMinutes}m`
+        `   Claude, Codex and Kimi counters  ${
+          config.enabled && config.scan && collectorInstalled
+            ? `scanned in the background every ${config.scanIntervalMinutes}m`
             : "need vibecom scan"
         }`
       )
@@ -1831,9 +1863,11 @@ async function autopilot(args: string[]): Promise<void> {
   if (sub === "off") {
     writeAutopilot({ ...config, enabled: false });
     const removed = removeSessionHook();
+    const collectorRemoved = removeScanAgent();
     p.log.success(
       removed ? "autopilot off — session hook removed" : "autopilot off"
     );
+    if (collectorRemoved) p.log.info("all-provider background collector removed");
     p.log.info("linked projects keep reporting; nothing new is connected");
     return;
   }
@@ -1845,9 +1879,12 @@ async function autopilot(args: string[]): Promise<void> {
       tier: config.enabled ? config.tier : prevailingTier(),
     };
     const { backup } = installSessionHook(hookBinary());
+    if (next.scan) installScanAgent(hookBinary(), next.scanIntervalMinutes);
+    const bridge = installSuperconductorCodexBridge(hookBinary());
     writeAutopilot(next);
     p.log.success(`autopilot on — tier ${next.tier}`);
     if (backup) p.log.info(`settings backed up to ${backup}`);
+    if (bridge.installed) p.log.info("Superconductor Codex counter bridge ready for new app-server sessions");
     reportAutopilot(next);
     return;
   }
@@ -2030,8 +2067,13 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     }
     p.outro(pc.dim("your calendar and clock now reflect when you worked"));
   },
-  scan: async () => {
+  scan: async (args) => {
     requireLogin();
+    const quiet = args.includes("--quiet");
+    if (quiet) {
+      await runScan(false);
+      return;
+    }
     p.intro(gradient("  scan  "));
     const progress = { label: "reading transcripts from Claude Code, Codex and Kimi" };
     const r = await pulse(progress, runScan(false, progress));
@@ -2065,6 +2107,17 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   /* Machine-facing, so it is deliberately absent from `help`: Claude Code
      invokes it with the SessionStart payload on stdin. */
   hook: async () => sessionHook(),
+  /* Invoked only by Superconductor's managed Codex wrapper. The protocol
+     proxy handles no human input itself; it forwards JSON-RPC byte-for-byte. */
+  "codex-app-server": async (args) => {
+    const separator = args.indexOf("--");
+    const realFlag = args.indexOf("--real");
+    const real = realFlag >= 0 ? args[realFlag + 1] : undefined;
+    if (!real || separator < 0 || separator <= realFlag + 1) {
+      throw new Error("usage: vibecom codex-app-server --real <binary> -- <args>");
+    }
+    process.exitCode = await runCodexAppServerProxy(real, args.slice(separator + 1));
+  },
   sync: async () => {
     p.intro(gradient("  sync  "));
     const healed = syncWorktrees();

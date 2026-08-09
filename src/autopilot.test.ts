@@ -25,6 +25,8 @@ import {
   readAutopilot,
   removeSessionHook,
   runAutopilot,
+  scanAgentPath,
+  scanAgentPlist,
   scanDue,
   sessionHookInstalled,
   staleReason,
@@ -134,6 +136,17 @@ test("a written config round-trips", () => {
   assert.equal(parsed.tier, 3);
   assert.equal(parsed.scanIntervalMinutes, 30);
   fs.rmSync(AUTOPILOT_FILE, { force: true });
+});
+
+test("the all-provider collector invokes only the installed CLI in quiet scan mode", () => {
+  const plist = scanAgentPlist("/Users/example/.local/bin/vibecom", 5);
+  assert.match(plist, /<string>\/Users\/example\/.local\/bin\/vibecom<\/string>/);
+  assert.match(plist, /<string>scan<\/string><string>--quiet<\/string>/);
+  assert.match(plist, /<key>StartInterval<\/key><integer>300<\/integer>/);
+  assert.match(
+    scanAgentPath("/Users/example"),
+    /\/Users\/example\/Library\/LaunchAgents\/build\.vibecom\.collect\.plist$/
+  );
 });
 
 /* ------- who may be linked without a prompt ------- */

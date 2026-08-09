@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -60,7 +61,10 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   tier: 1,
   autoLink: true,
   scan: true,
-  scanIntervalMinutes: 15,
+  /* A running chat keeps appending usage to its local archive. Five minutes is
+     short enough for the activity page to feel live, without repeatedly
+     walking a large archive while someone is actively coding. */
+  scanIntervalMinutes: 5,
 };
 
 const asTier = (value: unknown): 1 | 2 | 3 =>
@@ -454,3 +458,108 @@ export function uncoveredEverywhere(
 }
 
 export const worktreeCount = (root: string): number => listWorktrees(root).length;
+
+/* ------- provider-neutral background collection ------- */
+
+const SCAN_AGENT_LABEL = "build.vibecom.collect";
+
+/**
+ * Claude's SessionStart hook is useful for auto-linking a new checkout, but it
+ * cannot observe a Codex app-server process or a Kimi session that starts
+ * elsewhere. macOS LaunchAgents give all three providers the same collector:
+ * each run reads their own local counter archives and uploads only the derived
+ * totals already documented in COLLECTION.md.
+ */
+export const scanAgentPath = (home = os.homedir()): string =>
+  path.join(home, "Library", "LaunchAgents", `${SCAN_AGENT_LABEL}.plist`);
+
+const launchDomain = (): string => `gui/${process.getuid?.() ?? 0}`;
+
+function xml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+export function scanAgentPlist(binary: string, intervalMinutes: number): string {
+  const intervalSeconds = Math.max(60, Math.round(intervalMinutes * 60));
+  const log = path.join(CONFIG_DIR, "collector.log");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${SCAN_AGENT_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${xml(binary)}</string><string>scan</string><string>--quiet</string>
+  </array>
+  <key>StartInterval</key><integer>${intervalSeconds}</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${xml(log)}</string>
+  <key>StandardErrorPath</key><string>${xml(log)}</string>
+</dict></plist>
+`;
+}
+
+/** Install (or replace) the private per-user launch agent on macOS. */
+export function installScanAgent(
+  binary: string,
+  intervalMinutes: number,
+  home = os.homedir(),
+  platform = process.platform
+): { path: string; installed: boolean } {
+  const file = scanAgentPath(home);
+  if (platform !== "darwin") return { path: file, installed: false };
+  if (!path.isAbsolute(binary)) {
+    throw new Error("collector binary must be an absolute path");
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, scanAgentPlist(binary, intervalMinutes), {
+    mode: 0o600,
+  });
+  fs.chmodSync(file, 0o600);
+
+  /* `bootstrap` replaces the old launchd definition immediately. A new login
+     also loads the plist normally, so a transient launchctl failure is not a
+     reason to discard a correctly written schedule. */
+  try {
+    execFileSync("/bin/launchctl", ["bootout", launchDomain(), file], {
+      stdio: "ignore",
+    });
+  } catch {
+    // Not loaded yet is the usual first-install case.
+  }
+  try {
+    execFileSync("/bin/launchctl", ["bootstrap", launchDomain(), file], {
+      stdio: "ignore",
+    });
+  } catch {
+    // launchd will load it next login; the schedule still persists safely.
+  }
+  return { path: file, installed: true };
+}
+
+export function removeScanAgent(
+  home = os.homedir(),
+  platform = process.platform
+): boolean {
+  const file = scanAgentPath(home);
+  if (platform !== "darwin") return false;
+  try {
+    execFileSync("/bin/launchctl", ["bootout", launchDomain(), file], {
+      stdio: "ignore",
+    });
+  } catch {
+    // It can be absent from launchd even while the on-disk definition exists.
+  }
+  try {
+    fs.rmSync(file, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export const scanAgentInstalled = (home = os.homedir()): boolean =>
+  fs.existsSync(scanAgentPath(home));
