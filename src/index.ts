@@ -659,6 +659,19 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
     );
     return 0;
   }
+  /* Whole-machine tracking is the opt-out choice the builder just confirmed.
+     Install the one-time plumbing now, rather than leaving a successful setup
+     dependent on a later `autopilot on` command. A linked global slot still
+     works if a local settings file needs attention, so surface that narrowly
+     and continue with the historical import. */
+  try {
+    enableAutopilot({ ...readAutopilot(), enabled: true });
+  } catch (error) {
+    p.log.warn(
+      "Automatic collection needs attention — run `vibecom autopilot on`: " +
+        (error instanceof Error ? error.message : String(error))
+    );
+  }
   const count = 1;
   void searchDir;
 
@@ -761,11 +774,21 @@ async function runScan(
   days: string[];
 }> {
   /* Superconductor regenerates its provider wrappers during some app updates.
-     Autopilot is explicit consent for this bridge, so repair the narrow Codex
-     hook before a scheduled scan instead of quietly losing a new app-server
-     session after an otherwise harmless host update. */
-  if (readAutopilot().enabled && !superconductorBridgeInstalled()) {
-    installSuperconductorCodexBridge(hookBinary());
+     Repair the narrow Codex bridge before a scheduled scan, so opt-out
+     tracking does not quietly lose a new app-server session. */
+  const autopilot = readAutopilot();
+  if (autopilot.enabled) {
+    /* A CLI update replaces the executable but cannot retroactively install a
+       launchd job. Repair it during the first scan, which is idempotent and
+       ensures the next scan happens without the builder remembering a command.
+       The collector is provider-neutral; the Claude session hook is not needed
+       for archive-based Claude/Codex/Kimi accounting. */
+    if (autopilot.scan && !scanAgentInstalled()) {
+      installScanAgent(hookBinary(), autopilot.scanIntervalMinutes);
+    }
+    if (!superconductorBridgeInstalled()) {
+      installSuperconductorCodexBridge(hookBinary());
+    }
   }
   const slots = listSlots();
   if (slots.length === 0)
@@ -1805,6 +1828,23 @@ function prevailingTier(): 1 | 2 | 3 {
   return best;
 }
 
+function enableAutopilot(config = readAutopilot()): {
+  config: AutopilotConfig;
+  backup: string | null;
+  bridgeInstalled: boolean;
+} {
+  const next: AutopilotConfig = {
+    ...config,
+    enabled: true,
+    tier: config.enabled ? config.tier : prevailingTier(),
+  };
+  const { backup } = installSessionHook(hookBinary());
+  if (next.scan) installScanAgent(hookBinary(), next.scanIntervalMinutes);
+  const bridge = installSuperconductorCodexBridge(hookBinary());
+  writeAutopilot(next);
+  return { config: next, backup, bridgeInstalled: bridge.installed };
+}
+
 function reportAutopilot(config: AutopilotConfig) {
   const installed = sessionHookInstalled();
   const collectorInstalled = scanAgentInstalled();
@@ -1873,19 +1913,11 @@ async function autopilot(args: string[]): Promise<void> {
   }
 
   if (sub === "on") {
-    const next: AutopilotConfig = {
-      ...config,
-      enabled: true,
-      tier: config.enabled ? config.tier : prevailingTier(),
-    };
-    const { backup } = installSessionHook(hookBinary());
-    if (next.scan) installScanAgent(hookBinary(), next.scanIntervalMinutes);
-    const bridge = installSuperconductorCodexBridge(hookBinary());
-    writeAutopilot(next);
-    p.log.success(`autopilot on — tier ${next.tier}`);
-    if (backup) p.log.info(`settings backed up to ${backup}`);
-    if (bridge.installed) p.log.info("Superconductor Codex counter bridge ready for new app-server sessions");
-    reportAutopilot(next);
+    const enabled = enableAutopilot(config);
+    p.log.success(`autopilot on — tier ${enabled.config.tier}`);
+    if (enabled.backup) p.log.info(`settings backed up to ${enabled.backup}`);
+    if (enabled.bridgeInstalled) p.log.info("Superconductor Codex counter bridge ready for new app-server sessions");
+    reportAutopilot(enabled.config);
     return;
   }
 

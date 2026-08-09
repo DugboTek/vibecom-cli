@@ -110,10 +110,10 @@ function spyLink() {
 
 /* ------- configuration ------- */
 
-test("a missing config reads as the conservative default", () => {
+test("a missing config opts into automatic collection", () => {
   fs.rmSync(AUTOPILOT_FILE, { force: true });
   assert.deepEqual(readAutopilot(), DEFAULT_AUTOPILOT);
-  assert.equal(readAutopilot().enabled, false);
+  assert.equal(readAutopilot().enabled, true);
 });
 
 test("a hand-edited config cannot widen collection past a real tier", () => {

@@ -57,7 +57,9 @@ export const AUTOPILOT_FILE = path.join(CONFIG_DIR, "autopilot.json");
 const STATE_FILE = path.join(CONFIG_DIR, "autopilot-state.json");
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  enabled: false,
+  /* Tracking is opt-out: a first-time setup turns it on, and `autopilot off`
+     remains the explicit, durable way to stop unattended collection. */
+  enabled: true,
   tier: 1,
   autoLink: true,
   scan: true,
@@ -76,15 +78,16 @@ const asBool = (value: unknown, fallback: boolean): boolean =>
 /**
  * Read the config defensively.
  *
- * This file decides whether an unattended process may mint credentials, so a
- * hand-edited or truncated copy must degrade to the most conservative reading
- * rather than to whatever `undefined` happens to coerce to.
+ * A missing file means the builder has never made a choice, so use the
+ * opt-out default. A malformed existing file is different: retain the safe
+ * fail-closed behaviour rather than treating corruption as permission.
  */
 export function readAutopilot(): AutopilotConfig {
+  const hasConfig = fs.existsSync(AUTOPILOT_FILE);
   const raw = readJson<Partial<AutopilotConfig>>(AUTOPILOT_FILE, {});
   const interval = Number(raw.scanIntervalMinutes);
   return {
-    enabled: asBool(raw.enabled, DEFAULT_AUTOPILOT.enabled),
+    enabled: asBool(raw.enabled, hasConfig ? false : DEFAULT_AUTOPILOT.enabled),
     tier: asTier(raw.tier),
     autoLink: asBool(raw.autoLink, DEFAULT_AUTOPILOT.autoLink),
     scan: asBool(raw.scan, DEFAULT_AUTOPILOT.scan),
