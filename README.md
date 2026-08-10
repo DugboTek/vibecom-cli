@@ -65,6 +65,27 @@ Or use the one-line installer:
 curl -fsSL https://vibecom.build/setup.sh | bash
 ```
 
+---
+
+## See the work, not just the counter
+
+The CLI gives your existing coding activity a public, verified home. The live
+board shows what the community is shipping; every builder profile turns their
+own telemetry into legible progress.
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><strong>Live weekly leaderboard</strong><br/><br/>
+      <a href="https://www.vibecom.build/"><img src="https://www.vibecom.build/leaderboard/opengraph-image" alt="vibecom weekly builder leaderboard" width="100%" /></a>
+    </td>
+    <td width="50%" valign="top"><strong>Verified builder stats</strong><br/><br/>
+      <a href="https://www.vibecom.build/u/nova"><img src="https://www.vibecom.build/u/nova/opengraph-image" alt="vibecom verified builder stats" width="100%" /></a>
+    </td>
+  </tr>
+</table>
+
+<p align="center"><a href="https://www.vibecom.build/">See the live leaderboard</a> · <a href="https://www.vibecom.build/cli">How the collector works</a></p>
+
 <details>
 <summary><b>Rather not pipe a script into bash?</b></summary>
 
