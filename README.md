@@ -55,6 +55,13 @@ code never sends.
 ## Install
 
 ```bash
+npm install --global vibecom-cli
+vibecom
+```
+
+Or use the one-line installer:
+
+```bash
 curl -fsSL https://vibecom.build/setup.sh | bash
 ```
 

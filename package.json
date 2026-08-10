@@ -1,8 +1,31 @@
 {
   "name": "vibecom-cli",
   "version": "1.0.24",
-  "description": "The vibecom CLI — reads coding-session counters off disk and sends only what COLLECTION.md documents.",
+  "description": "Privacy-first CLI that turns Codex and Claude Code activity into a verified vibecom builder profile and leaderboard rank.",
   "license": "MIT",
+  "homepage": "https://www.vibecom.build/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DugboTek/vibecom-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DugboTek/vibecom-cli/issues"
+  },
+  "keywords": [
+    "ai",
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "developer-tools",
+    "opentelemetry",
+    "vibe-coding"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "COLLECTION.md"
+  ],
   "bin": {
     "vibecom": "dist/cli.js"
   },
