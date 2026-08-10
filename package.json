@@ -1,6 +1,6 @@
 {
   "name": "vibecom-cli",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Privacy-first CLI that turns Codex and Claude Code activity into a verified vibecom builder profile and leaderboard rank.",
   "license": "MIT",
   "homepage": "https://www.vibecom.build/cli",
