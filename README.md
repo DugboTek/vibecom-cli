@@ -70,18 +70,12 @@ curl -fsSL https://vibecom.build/setup.sh | bash
 ## See the work, not just the counter
 
 The CLI gives your existing coding activity a public, verified home: a live
-podium for the community, and useful stats for your own progress.
+podium for the builders currently shipping.
 
-<table>
-  <tr>
-    <td width="50%" valign="top"><strong>Live weekly podium</strong><br/><br/>
-      <a href="https://www.vibecom.build/"><img src="https://www.vibecom.build/leaderboard/opengraph-image?v=podium-v2" alt="vibecom weekly builder leaderboard podium" width="100%" /></a>
-    </td>
-    <td width="50%" valign="top"><strong>Verified builder stats</strong><br/><br/>
-      <a href="https://www.vibecom.build/cli"><img src="https://www.vibecom.build/cli/opengraph-image" alt="vibecom CLI verified builder stats" width="100%" /></a>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <strong>Live weekly podium</strong><br/><br/>
+  <a href="https://www.vibecom.build/"><img src="https://www.vibecom.build/leaderboard/opengraph-image?v=podium-v2" alt="vibecom weekly builder leaderboard podium" width="100%" /></a>
+</p>
 
 <p align="center"><a href="https://www.vibecom.build/">See the live leaderboard</a> · <a href="https://www.vibecom.build/cli">How the collector works</a></p>
 
