@@ -69,17 +69,16 @@ curl -fsSL https://vibecom.build/setup.sh | bash
 
 ## See the work, not just the counter
 
-The CLI gives your existing coding activity a public, verified home. The live
-board shows what the community is shipping; every builder profile turns their
-own telemetry into legible progress.
+The CLI gives your existing coding activity a public, verified home: a live
+podium for the community, and useful stats for your own progress.
 
 <table>
   <tr>
-    <td width="50%" valign="top"><strong>Live weekly leaderboard</strong><br/><br/>
+    <td width="50%" valign="top"><strong>Live weekly podium</strong><br/><br/>
       <a href="https://www.vibecom.build/"><img src="https://www.vibecom.build/leaderboard/opengraph-image" alt="vibecom weekly builder leaderboard" width="100%" /></a>
     </td>
     <td width="50%" valign="top"><strong>Verified builder stats</strong><br/><br/>
-      <a href="https://www.vibecom.build/u/nova"><img src="https://www.vibecom.build/u/nova/opengraph-image" alt="vibecom verified builder stats" width="100%" /></a>
+      <a href="https://www.vibecom.build/cli"><img src="https://www.vibecom.build/cli/opengraph-image" alt="vibecom CLI verified builder stats" width="100%" /></a>
     </td>
   </tr>
 </table>
