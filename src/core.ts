@@ -282,18 +282,10 @@ export type ScanMark = {
    * requires the current value before it will treat a mark as up to date, so
    * every mark written under an old value is re-read exactly once.
    *
-   * `SCAN_VERSION` below is the current value (3, bumped from 2 because the
-   * snapshot shape changed — see `SCAN_VERSION`'s doc comment). The type
-   * stays a union of the last two values, not the bare current one: this
-   * field is read out of marks already on disk, and `index.ts` — which owns
-   * both the comparison and the write of this field — has not yet been
-   * updated to move off the literal `2` it still reads and writes. Narrowing
-   * this to `3` only would make every existing call in `index.ts` a type
-   * error before that update lands, for a field whose type carries no
-   * runtime check anyway. Once `index.ts` is updated to use `SCAN_VERSION`
-   * throughout, this can narrow back down to `typeof SCAN_VERSION`.
+   * Retain older values when reading stored marks. Version 4 restates sessions
+   * that an older collector could mark complete after a truncated upload.
    */
-  scanVersion?: 2 | 3;
+  scanVersion?: 2 | 3 | 4;
 };
 
 /**
@@ -303,7 +295,7 @@ export type ScanMark = {
  * hardcoded number, so the two can never drift out of step the way a
  * duplicated literal invites.
  */
-export const SCAN_VERSION = 3 as const;
+export const SCAN_VERSION = 4 as const;
 
 /** `tool:sessionId` -> what has already been sent for it. */
 export type ScanMarks = Record<string, ScanMark>;
