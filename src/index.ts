@@ -921,14 +921,6 @@ async function runScan(
       { usage, key },
     ]);
     byTool[usage.tool] = (byTool[usage.tool] ?? 0) + 1;
-    tokens +=
-      usage.inputTokens +
-      usage.outputTokens +
-      usage.cacheReadTokens +
-      usage.cacheCreationTokens;
-    for (const bucket of usage.activity) {
-      days.add(new Date(bucket.bucketAtMs).toISOString().slice(0, 10));
-    }
   }
 
   let sent = 0;
@@ -975,7 +967,14 @@ async function runScan(
         );
         sent += res.accepted;
         sessions += batch.length;
-        for (const b of batch) marks[b.key] = markFor(b.usage, slot.root);
+        for (const b of batch) {
+          marks[b.key] = markFor(b.usage, slot.root);
+          tokens += b.usage.inputTokens + b.usage.outputTokens +
+            b.usage.cacheReadTokens + b.usage.cacheCreationTokens;
+          for (const bucket of b.usage.activity) {
+            days.add(new Date(bucket.bucketAtMs).toISOString().slice(0, 10));
+          }
+        }
       } catch (e) {
         /* 401/403 is the server saying this credential is no longer valid.
            Recording it stops the next scan re-trying a revoked token, and
@@ -2086,6 +2085,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       );
     }
     for (const f of r.failed) p.log.warn(f);
+    if (r.failed.length > 0) process.exitCode = 1;
     if (r.repos > 0) {
       console.log(
         bullet(
@@ -2106,13 +2106,19 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     requireLogin();
     const quiet = args.includes("--quiet");
     if (quiet) {
-      await runScan(false);
+      const result = await runScan(false);
+      // Silence successful unattended runs, never failures. launchd's log and
+      // exit status must explain why a profile has stopped receiving activity.
+      for (const failure of result.failed) console.error(`vibecom collector: ${failure}`);
+      if (result.failed.length > 0) process.exitCode = 1;
       return;
     }
     p.intro(gradient("  scan  "));
     const progress = { label: "reading transcripts from Claude Code, Codex and Kimi" };
     const r = await pulse(progress, runScan(false, progress));
-    if (r.sessions === 0) {
+    if (r.sessions === 0 && r.failed.length > 0) {
+      p.log.warn("no sessions uploaded — collection needs attention");
+    } else if (r.sessions === 0) {
       p.log.success("nothing new since the last scan");
     } else {
       p.log.success(
@@ -2122,6 +2128,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       );
     }
     for (const f of r.failed) p.log.warn(f);
+    if (r.failed.length > 0) process.exitCode = 1;
     if (r.repos > 0) {
       console.log(
         bullet(
