@@ -103,6 +103,7 @@ import {
   installScanAgent,
   removeScanAgent,
   scanAgentInstalled,
+  scanAgentLoaded,
   sessionHookInstalled,
   uncoveredEverywhere,
   writeAutopilot,
@@ -1594,6 +1595,7 @@ async function doctor() {
   };
 
   const cred = readCredentials();
+  const autopilot = readAutopilot();
   say(
     Boolean(cred),
     `signed in as ${pc.bold(cred?.username ?? "")}`,
@@ -1667,6 +1669,15 @@ async function doctor() {
     );
   }
 
+  if (process.platform === "darwin" && autopilot.enabled && autopilot.scan) {
+    say(
+      scanAgentInstalled() && scanAgentLoaded(),
+      "background collector has a working Node runtime and a loaded schedule",
+      "background collector is missing, outdated, or not loaded",
+      "vibecom autopilot on"
+    );
+  }
+
   const tools = transcriptSources().filter((source) => source.files.length > 0);
   say(
     tools.length > 0,
@@ -1681,7 +1692,9 @@ async function doctor() {
   if (problems.length === 0) {
     p.outro(
       `${pc.green("Everything is working.")} ${pc.dim(
-        "Code as normal — activity uploads on its own."
+        autopilot.enabled && autopilot.scan
+          ? "Code as normal — activity uploads on its own."
+          : "Manual tracking is enabled — run vibecom scan to upload activity."
       )}`
     );
     return;

@@ -594,3 +594,17 @@ export function scanAgentInstalled(home = os.homedir(), nodeBinary = process.exe
     return false;
   }
 }
+
+/** A correct plist on disk does not mean launchd has loaded its schedule. */
+export function scanAgentLoaded(): boolean {
+  if (process.platform !== "darwin") return false;
+  try {
+    execFileSync("/bin/launchctl", ["print", `${launchDomain()}/${SCAN_AGENT_LABEL}`], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
