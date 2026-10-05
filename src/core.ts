@@ -42,7 +42,7 @@ function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
-function readJson<T>(file: string, fallback: T): T {
+export function readJson<T>(file: string, fallback: T): T {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8")) as T;
   } catch {
@@ -50,7 +50,7 @@ function readJson<T>(file: string, fallback: T): T {
   }
 }
 
-function writeJson(file: string, value: unknown) {
+export function writeJson(file: string, value: unknown) {
   ensureDir(path.dirname(file));
   writePrivateFile(file, JSON.stringify(value, null, 2) + "\n");
 }
@@ -276,9 +276,34 @@ export type ScanMark = {
   model?: string | null;
   /** Forces one snapshot backfill when duration-aware scanning first ships. */
   activityVersion?: 1;
-  /** Parser/rate schema version; a bump forces one corrective full restatement. */
-  scanVersion?: 2;
+  /**
+   * Parser/rate schema version; a bump forces one corrective full
+   * restatement — the freshness check in `runScan` (`cli/src/index.ts`)
+   * requires the current value before it will treat a mark as up to date, so
+   * every mark written under an old value is re-read exactly once.
+   *
+   * `SCAN_VERSION` below is the current value (3, bumped from 2 because the
+   * snapshot shape changed — see `SCAN_VERSION`'s doc comment). The type
+   * stays a union of the last two values, not the bare current one: this
+   * field is read out of marks already on disk, and `index.ts` — which owns
+   * both the comparison and the write of this field — has not yet been
+   * updated to move off the literal `2` it still reads and writes. Narrowing
+   * this to `3` only would make every existing call in `index.ts` a type
+   * error before that update lands, for a field whose type carries no
+   * runtime check anyway. Once `index.ts` is updated to use `SCAN_VERSION`
+   * throughout, this can narrow back down to `typeof SCAN_VERSION`.
+   */
+  scanVersion?: 2 | 3;
 };
+
+/**
+ * The current scan/parser schema version. Bump this — never a bare literal —
+ * when a restatement must be forced; `index.ts`'s freshness check and its
+ * `markFor` writer must both compare/assign this constant rather than a
+ * hardcoded number, so the two can never drift out of step the way a
+ * duplicated literal invites.
+ */
+export const SCAN_VERSION = 3 as const;
 
 /** `tool:sessionId` -> what has already been sent for it. */
 export type ScanMarks = Record<string, ScanMark>;
@@ -356,8 +381,17 @@ export async function sendScanned(
         ...(slice.model ? [attr("model", slice.model)] : []),
         /* Session facts belong on one slice only. Token and cost rows belong
            on every slice, which gives the server a truthful model breakdown
-           without multiplying turns or elapsed time. */
-        ...(index === 0 ? [attr("turns", s.turns)] : []),
+           without multiplying turns or elapsed time. `sessions` is a session
+           fact for the same reason `turns` is: it is what lets this restated
+           session replace the live `claude_code.session.count` row the same
+           session produced under the global token before it was scanned (or
+           before its repo was linked) — the snapshot only ever deletes the
+           metric types it carries, so omitting this one left that phantom
+           row in the global bucket forever, no matter how many times the
+           session was rescanned. */
+        ...(index === 0
+          ? [attr("turns", s.turns), attr("sessions", 1)]
+          : []),
         attr("input_tokens", slice.inputTokens),
         attr("output_tokens", slice.outputTokens),
         attr("cache_read_tokens", slice.cacheReadTokens),
@@ -596,7 +630,16 @@ export function listWorktrees(cwd = process.cwd()): string[] {
     .filter((l) => l.startsWith("worktree "))
     .map((l) => l.slice("worktree ".length).trim())
     .filter(Boolean)
-    .map(realpath);
+    .map(realpath)
+    /* Git keeps listing a checkout whose .git has been removed — it reports it
+       as `prunable` and still hands it to us. Agent tools leave these behind
+       constantly. Every git command inside one fails, so the ignore rule can
+       never be verified there, and prepareProjectSettings refuses to write a
+       token it cannot prove is protected. That refusal is correct, but it was
+       aborting the whole repository: five live projects could not be linked or
+       re-pointed because of one directory that no longer had a .git in it. A
+       checkout without one is not a checkout. */
+    .filter((tree) => fs.existsSync(path.join(tree, ".git")));
 }
 
 export const gitRemote = (root: string) =>
@@ -1079,9 +1122,223 @@ export function ensureGitignored(root: string): boolean {
   return true;
 }
 
+/* ------- exclusions ------- */
+
+export const EXCLUDED_FILE = path.join(CONFIG_DIR, "excluded.json");
+
+/** Repos and owners a person has explicitly opted back out of. */
+export type ExcludedConfig = {
+  /** canonical `projectRoot()` values, matched by exact string */
+  roots: string[];
+  /** remote owners, matched case-insensitively like `trusted_owners.json` */
+  owners: string[];
+};
+
+/**
+ * The result of reading `excluded.json`.
+ *
+ * `ok: false` means the file exists but cannot be trusted — corrupt JSON, an
+ * unexpected shape, a read error — and is the signal a caller that has
+ * already committed to the conservative reading needs: `excluded` is still
+ * populated with whatever could be salvaged, but a caller deciding *whether*
+ * to fall back to a shared bucket (the scan's global fallback, in
+ * particular — §7.9) must treat `ok: false` as "cannot verify nothing here
+ * was opted out" and refuse to fall back at all, not as "nothing is
+ * excluded". Collapsing both cases to the same `{ roots: [], owners: [] }`
+ * shape would make every caller's "is X excluded?" check answer "no" for a
+ * file it could not actually read, which is the one wrong answer that
+ * silently defeats an opt-out.
+ */
+export type ExcludedRead =
+  | { ok: true; excluded: ExcludedConfig }
+  | { ok: false; excluded: ExcludedConfig; reason: string };
+
+const emptyExcluded = (): ExcludedConfig => ({ roots: [], owners: [] });
+
+function asStringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((v) => typeof v === "string")
+    ? (value as string[])
+    : null;
+}
+
+/**
+ * Read `excluded.json` defensively — the house pattern is `readAutopilot`
+ * (`autopilot.ts`): a hand-edited or truncated copy must degrade to the most
+ * conservative reading available, never to whatever `undefined` happens to
+ * coerce to. Unlike `readAutopilot`, "conservative" here cannot mean a fixed
+ * safe default value, because the content itself *is* the safety property —
+ * so an unreadable file is reported as unreadable (`ok: false`) rather than
+ * silently read as "nothing excluded".
+ */
+export function readExcluded(): ExcludedRead {
+  if (!fs.existsSync(EXCLUDED_FILE)) {
+    return { ok: true, excluded: emptyExcluded() };
+  }
+  let raw: string;
+  try {
+    raw = fs.readFileSync(EXCLUDED_FILE, "utf8");
+  } catch (error) {
+    return {
+      ok: false,
+      excluded: emptyExcluded(),
+      reason: `could not read ${EXCLUDED_FILE}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  if (raw.trim() === "") {
+    return { ok: true, excluded: emptyExcluded() };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {
+      ok: false,
+      excluded: emptyExcluded(),
+      reason: `${EXCLUDED_FILE} is not valid JSON`,
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      excluded: emptyExcluded(),
+      reason: `${EXCLUDED_FILE} is not a JSON object`,
+    };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const roots = asStringArray(obj.roots);
+  const owners = asStringArray(obj.owners);
+  if (roots === null || owners === null) {
+    return {
+      ok: false,
+      excluded: { roots: roots ?? [], owners: owners ?? [] },
+      reason: `${EXCLUDED_FILE} has an unexpected shape`,
+    };
+  }
+  return { ok: true, excluded: { roots, owners } };
+}
+
+export function isRootExcluded(excluded: ExcludedConfig, root: string): boolean {
+  return excluded.roots.includes(root);
+}
+
+export function isOwnerExcluded(excluded: ExcludedConfig, owner: string): boolean {
+  const needle = owner.toLowerCase();
+  return excluded.owners.some((o) => o.toLowerCase() === needle);
+}
+
+/**
+ * Every write starts from the best-effort read, the same recovery the
+ * codebase already accepts for `trusted_owners.json` and `autopilot.json`: a
+ * corrupt `excluded.json` is replaced by one that at least records the
+ * exclusion the person is actively asking for right now, rather than
+ * refusing the very action meant to fix the file.
+ */
+function writeExcludedConfig(excluded: ExcludedConfig): void {
+  writeJson(EXCLUDED_FILE, excluded);
+}
+
+/** Declining an owner review must exclude the owner (D3) — "no" that only
+ *  skips one link and keeps asking, or keeps counting namelessly, is not an
+ *  opt-out. These four are the whole vocabulary `vibecom exclude`/`include`
+ *  need, by repo root or by owner. */
+export function excludeRoot(root: string): void {
+  const { excluded } = readExcluded();
+  if (isRootExcluded(excluded, root)) return;
+  writeExcludedConfig({ ...excluded, roots: [...excluded.roots, root] });
+}
+
+export function includeRoot(root: string): void {
+  const { excluded } = readExcluded();
+  writeExcludedConfig({
+    ...excluded,
+    roots: excluded.roots.filter((r) => r !== root),
+  });
+}
+
+export function excludeOwner(owner: string): void {
+  const { excluded } = readExcluded();
+  if (isOwnerExcluded(excluded, owner)) return;
+  writeExcludedConfig({ ...excluded, owners: [...excluded.owners, owner] });
+}
+
+export function includeOwner(owner: string): void {
+  const { excluded } = readExcluded();
+  const needle = owner.toLowerCase();
+  writeExcludedConfig({
+    ...excluded,
+    owners: excluded.owners.filter((o) => o.toLowerCase() !== needle),
+  });
+}
+
+/**
+ * Disable Claude Code's live exporter for one checkout, regardless of what a
+ * machine-wide (or later, trusted-owner) config says.
+ *
+ * Project-level `settings.local.json` env overrides user-level
+ * `settings.json` env per key (§3.1) — the same override direction a normal
+ * link relies on to take effect, read backwards: writing
+ * `CLAUDE_CODE_ENABLE_TELEMETRY=0` here means a later `vibecom` run that
+ * turns on whole-machine tracking cannot silently re-enable this one
+ * repository. No token is written, so `writeProjectSettings`'s
+ * git-tracked/.gitignore preflight does not apply to this file — but the
+ * file is still recorded in the shared git dir's `info/exclude`, so it can
+ * never land in a commit through some unrelated ignore-pattern change later.
+ */
+export function writeExclusionSettings(root: string): string {
+  const file = safeSettingsPath(root, true);
+  const data = readJson<Record<string, unknown>>(file, {});
+  const env = (
+    typeof data.env === "object" && data.env !== null ? data.env : {}
+  ) as Record<string, string>;
+  env.CLAUDE_CODE_ENABLE_TELEMETRY = "0";
+  data.env = env;
+  writePrivateFile(file, JSON.stringify(data, null, 2) + "\n");
+  ensureExcluded(root);
+  return file;
+}
+
+/**
+ * Reverse `writeExclusionSettings`. Removes only the exact key/value it
+ * wrote: a project re-linked after being un-excluded legitimately carries
+ * `CLAUDE_CODE_ENABLE_TELEMETRY=1` from `writeProjectSettings`, and that
+ * value is not this function's to touch.
+ */
+export function removeExclusionSettings(root: string): void {
+  let file: string;
+  try {
+    file = safeSettingsPath(root, false);
+  } catch {
+    return;
+  }
+  if (!fs.existsSync(file)) return;
+  const data = readJson<Record<string, unknown>>(file, {});
+  const env = data.env as Record<string, string> | undefined;
+  if (!env || env.CLAUDE_CODE_ENABLE_TELEMETRY !== "0") return;
+  delete env.CLAUDE_CODE_ENABLE_TELEMETRY;
+  if (Object.keys(env).length === 0) delete data.env;
+  else data.env = env;
+  writePrivateFile(file, JSON.stringify(data, null, 2) + "\n");
+}
+
 /* ------- api ------- */
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  /**
+   * The HTTP status that produced this error, when there was one — a
+   * network-level failure (DNS, TLS, connection refused) never reaches a
+   * response and leaves this undefined. Callers that need to react
+   * specifically to a revoked token (401/403) rather than to "something
+   * failed" read this instead of pattern-matching the message, which is
+   * user-facing prose and is not a stable contract to branch on.
+   */
+  readonly status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -1124,10 +1381,11 @@ async function request<T>(
       throw new ApiError(
         `${origin} redirects to ${target}. Credentials are not carried across ` +
           `a redirect, so point the CLI at the canonical host: ` +
-          `VIBECOM_ORIGIN=${target} vibecom login`
+          `VIBECOM_ORIGIN=${target} vibecom login`,
+        res.status
       );
     }
-    throw new ApiError(`${origin} returned an unexpected redirect`);
+    throw new ApiError(`${origin} returned an unexpected redirect`, res.status);
   }
 
   if ((res.status === 429 || res.status >= 500) && attempt < 4) {
@@ -1148,7 +1406,8 @@ async function request<T>(
        fixes it, the way the redirect case above does. */
     if (res.status === 401 || res.status === 403) {
       throw new ApiError(
-        `your sign-in for ${origin} has expired — run \`vibecom login\` to sign in again`
+        `your sign-in for ${origin} has expired — run \`vibecom login\` to sign in again`,
+        res.status
       );
     }
     /* A 5xx here already survived four retries, so it is the server being
@@ -1159,11 +1418,13 @@ async function request<T>(
     if (res.status >= 500) {
       throw new ApiError(
         `${origin} is failing to respond (HTTP ${res.status}). Nothing is wrong ` +
-          `on your machine — wait a few minutes and run the same command again.`
+          `on your machine — wait a few minutes and run the same command again.`,
+        res.status
       );
     }
     throw new ApiError(
-      typeof body.error === "string" ? body.error : `HTTP ${res.status}`
+      typeof body.error === "string" ? body.error : `HTTP ${res.status}`,
+      res.status
     );
   }
   return body as T;
@@ -1267,7 +1528,8 @@ export async function selfUpdate(
   } catch {
     throw new ApiError(`could not reach ${origin}`);
   }
-  if (!res.ok) throw new ApiError(`HTTP ${res.status} fetching ${origin}/cli.js`);
+  if (!res.ok)
+    throw new ApiError(`HTTP ${res.status} fetching ${origin}/cli.js`, res.status);
   const body = await res.text();
 
   if (!body.startsWith("#!/usr/bin/env node")) {
@@ -1305,4 +1567,181 @@ export async function selfUpdate(
     from: VERSION,
     kind: here && there ? bumpKind(here, there) : "unknown",
   };
+}
+
+/* ------- linking ------- */
+
+export type LinkResult = {
+  slot: ProjectSlot;
+  /** every checkout that received the config, main worktree first */
+  worktrees: string[];
+  gitignoreAdded: boolean;
+};
+
+/**
+ * Forget scan marks that attributed a session to the global bucket.
+ *
+ * `runScan` skips any session whose mark is unchanged since the last scan, so
+ * a session already bucketed under the machine-wide slot is never
+ * re-examined once its transcript stops growing — its attribution freezes
+ * wrong forever unless something forces a re-read. Linking the repo it
+ * actually belongs to is exactly the moment that should force one: deleting
+ * only the marks whose recorded `root` is the global slot means the next
+ * scan re-parses precisely the sessions that might now belong here, and
+ * nothing else. A mark that already names a concrete project root was
+ * attributed correctly the first time and needs no repeat read — re-parsing
+ * a transcript from zero lines is not free, so over-invalidating would be
+ * unbounded cost for no benefit. Re-sending a session that turns out to
+ * still belong to the global bucket is a no-op: snapshot replacement is
+ * idempotent.
+ *
+ * `linkRepo` calls this on every successful link, so nothing else needs to.
+ * Exported anyway for a link path that does not go through `linkRepo` —
+ * today that is the interactive wizard's `applyLinks` in `index.ts`, which
+ * duplicates `linkRepo`'s sequence rather than calling it (see spec §1.7:
+ * that duplication is meant to be refactored away; until it is, this must be
+ * called after `applyLinks` writes a slot, or wizard-established links keep
+ * whatever their scan marks said before the link existed).
+ */
+export function invalidateGlobalScanMarks(): void {
+  const marks = readScanMarks();
+  let changed = false;
+  for (const key of Object.keys(marks)) {
+    if (marks[key].root === GLOBAL_SLOT_ROOT) {
+      delete marks[key];
+      changed = true;
+    }
+  }
+  if (changed) writeScanMarks(marks);
+}
+
+/**
+ * Mint one project's token and write it into every checkout of that project.
+ *
+ * Shared by the interactive wizard and the session hook so a link established
+ * without a prompt is byte-for-byte the same grant as one established with
+ * one — same ignore preflight, same worktree coverage, same rollback. Two
+ * copies of this sequence would eventually disagree about which protection is
+ * mandatory, and the unattended path is the worse one to get wrong.
+ */
+export async function linkRepo(
+  origin: string,
+  accountToken: string,
+  repo: { root: string; label: string; salt?: string },
+  tier: 1 | 2 | 3
+): Promise<LinkResult> {
+  const salt = repo.salt ?? newSalt();
+  const projectId = projectIdFor(salt, repo.root);
+  const worktrees = listWorktrees(repo.root);
+
+  // Establish and verify ignore protection before the server creates a bearer
+  // token or any checkout receives it.
+  const gitignoreAdded = ensureGitignored(repo.root);
+  ensureExcluded(repo.root);
+  for (const tree of worktrees) prepareProjectSettings(tree);
+
+  const minted = await mintProjectToken(origin, accountToken, {
+    projectId,
+    projectLabel: repo.label,
+    tier,
+  });
+
+  try {
+    for (const tree of worktrees) {
+      writeProjectSettings(tree, origin, minted.access_token);
+    }
+  } catch (error) {
+    /* A token that reached no checkout is a grant nobody asked for. Hand it
+       back rather than leave it live on the server. */
+    await revokeProjectToken(origin, accountToken, projectId).catch(
+      () => undefined
+    );
+    throw error;
+  }
+
+  const slot: ProjectSlot = {
+    root: repo.root,
+    salt,
+    projectId,
+    tier,
+    label: repo.label,
+    origin,
+    linkedAt: new Date().toISOString(),
+  };
+  writeSlot(slot);
+  /* Closes §1.3/§5.2: without this, a session already bucketed under the
+     global slot before this repo existed as a link stays there forever —
+     `runScan` never re-examines a transcript whose mark is unchanged. */
+  invalidateGlobalScanMarks();
+  return { slot, worktrees, gitignoreAdded };
+}
+
+/* ------- codex whole-machine config ------- */
+
+export const CODEX_CONFIG_FILE = path.join(os.homedir(), ".codex", "config.toml");
+
+/**
+ * Point Codex's OTLP exporter at the same place, with the same token.
+ *
+ * Codex keeps its exporter in its own config file, so the machine-wide token
+ * ends up written in two places. Nothing kept them in step: re-minting that
+ * token — which `vibecom login` does on any origin change — rewrote Claude
+ * Code's settings and left Codex holding a credential the server had already
+ * revoked. Codex went on exporting to a 401 and looked configured the whole
+ * time, which is the same silent failure as pointing at a host that no longer
+ * resolves. Written from the one place the token is issued, so the two cannot
+ * drift again.
+ *
+ * Best-effort by design: Codex may not be installed, and a machine without it
+ * is not a broken setup.
+ */
+export function writeCodexSettings(origin: string, token: string): boolean {
+  origin = secureOrigin(origin);
+  if (!fs.existsSync(CODEX_CONFIG_FILE)) return false;
+  let body: string;
+  try {
+    body = fs.readFileSync(CODEX_CONFIG_FILE, "utf8");
+  } catch {
+    return false;
+  }
+  const exporter =
+    `exporter = { otlp-http = { endpoint = "${origin}/api/v1/logs", ` +
+    `protocol = "json", headers = { "Authorization" = "Bearer ${token}" } } }`;
+
+  let next: string;
+  if (/^\[otel\]/m.test(body)) {
+    next = /^exporter = \{ otlp-http = .*$/m.test(body)
+      ? body.replace(/^exporter = \{ otlp-http = .*$/m, exporter)
+      : body.replace(/^\[otel\]$/m, "[otel]\n" + exporter);
+  } else {
+    next = body.replace(/\n*$/, "") + "\n\n[otel]\n" + exporter + "\n";
+  }
+  if (next === body) return false;
+  try {
+    /* Not writePrivateFile: this is the user's own config, and tightening its
+       mode as a side effect of adding a token is not ours to decide. */
+    fs.writeFileSync(CODEX_CONFIG_FILE, next);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Drop our exporter block, leaving the rest of Codex's config alone. */
+export function removeCodexSettings(): boolean {
+  if (!fs.existsSync(CODEX_CONFIG_FILE)) return false;
+  let body: string;
+  try {
+    body = fs.readFileSync(CODEX_CONFIG_FILE, "utf8");
+  } catch {
+    return false;
+  }
+  const next = body.replace(/\n?\[otel\]\nexporter = \{ otlp-http = .*\n/m, "\n");
+  if (next === body) return false;
+  try {
+    fs.writeFileSync(CODEX_CONFIG_FILE, next);
+    return true;
+  } catch {
+    return false;
+  }
 }

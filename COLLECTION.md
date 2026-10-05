@@ -8,8 +8,9 @@ document. If you find a discrepancy, that is a bug; please open an issue.
 ## The short version
 
 The CLI reads the session transcripts your coding tools already write to disk,
-adds up the numbers in them, and sends **counters only**. It never sends your
-code, your prompts, your file names, or your shell history.
+plus safe session metadata from supported desktop hosts, and sends **counters
+only**. It never sends your code, your prompts, your file names, or your shell
+history.
 
 ## Never collected
 
@@ -40,6 +41,7 @@ hour the session occupied, and one record per linked repository, to
 | `session.id` | string | The tool's own session id, or the transcript filename |
 | `model` | string | Model name, e.g. `claude-opus-5`, `gpt-5.6-sol`. Omitted if the transcript does not record one |
 | `turns` | number | Count of human prompts in the session |
+| `sessions` | number | Always `1`. Lets a restated session replace the one-row-per-session counter your coding tool's live connection already sent, so re-importing history never leaves a duplicate |
 | `input_tokens` | number | Sum of input tokens |
 | `output_tokens` | number | Sum of output tokens |
 | `cache_read_tokens` | number | Sum of cache-read tokens |
@@ -181,6 +183,27 @@ installer exported OTLP variables globally, which turned collection on for every
 repo on the machine including employers'. That was removed; see the note at the
 top of the installer.
 
+When you opt into `vibecom autopilot on` on macOS, the CLI also installs a
+private per-user LaunchAgent that runs `vibecom scan --quiet` at the configured
+interval (five minutes for a new setup). This is how **Claude Code, Codex, and
+Kimi** all stay current when they write their normal local archives, regardless
+of which terminal app launched them. It is not a process monitor and it does
+not read the screen, terminal scrollback, or a chat transcript beyond the
+counter fields described above.
+
+Superconductor's Codex `app-server` is the narrow exception: it deliberately
+does not create Codex's ordinary archive. When present, `vibecom autopilot on`
+adds an idempotent bridge to Superconductor's managed Codex wrapper. The bridge
+passes every JSON-RPC message straight through and saves only Codex's documented
+`thread/tokenUsage/updated` numeric totals plus thread id, model, working
+directory for local attribution, and timestamp. It does not save or send any
+other app-server message. New hosted Codex sessions use that bridge; historic
+sessions for which the host never retained counters cannot be reconstructed
+truthfully.
+
+`vibecom autopilot off` removes both the Claude SessionStart hook and this
+background collector. You can always run `vibecom scan` yourself instead.
+
 ## Re-importing history
 
 Scans restate each changed session in full. The server drops what it already
@@ -191,6 +214,32 @@ historical session, including unchanged sessions.
 Use it to backfill the duration-aware clock for old history. Imports made before
 session event times existed were stamped only at their upload or end time, so
 hours of work could appear as a single busy spike.
+
+### Claude Code history is local
+
+A rescan reads only the Claude Code transcript files currently present at
+`~/.claude/projects/`; it never retrieves account history from Anthropic. Claude
+Code retains those local files for 30 days by default via `cleanupPeriodDays`, so
+an old period can be backfilled only if its files remain on disk or are restored
+from an older machine or backup. Claude web activity is outside the CLI's
+collection scope. See [Anthropic's data-retention documentation](https://code.claude.com/docs/en/data-usage).
+
+### Desktop agent hosts
+
+When a supported desktop app launches Codex or Claude itself, its session may
+not appear in `~/.codex/sessions` or `~/.claude/projects`. The CLI also detects
+the local Conductor app database on macOS and reads only session metadata:
+provider/model, the locally resolved workspace used for attribution, timestamps,
+and whether a message was a human turn. It never selects `content`,
+`full_message`, prompts, or responses from that database.
+
+Conductor currently does not expose token counters in its local database. Those
+sessions therefore contribute verified sessions, turns, and active calendar
+days, but **not** an invented token or cost total. If a host exposes native
+usage counters later, the adapter may add those documented counters; it will
+never estimate them from conversation text. Other hosts are deliberately
+ignored until they have an equally narrow metadata contract, rather than being
+mislabelled as Codex or Claude.
 
 ## Consent tiers
 

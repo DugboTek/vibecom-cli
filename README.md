@@ -55,8 +55,29 @@ code never sends.
 ## Install
 
 ```bash
+npm install --global vibecom-cli
+vibecom
+```
+
+Or use the one-line installer:
+
+```bash
 curl -fsSL https://vibecom.build/setup.sh | bash
 ```
+
+---
+
+## See the work, not just the counter
+
+The CLI gives your existing coding activity a public, verified home: a live
+podium for the builders currently shipping.
+
+<p align="center">
+  <strong>Live weekly podium</strong><br/><br/>
+  <a href="https://www.vibecom.build/"><img src="https://www.vibecom.build/leaderboard/opengraph-image?v=podium-v2" alt="vibecom weekly builder leaderboard podium" width="100%" /></a>
+</p>
+
+<p align="center"><a href="https://www.vibecom.build/">See the live leaderboard</a> · <a href="https://www.vibecom.build/cli">How the collector works</a></p>
 
 <details>
 <summary><b>Rather not pipe a script into bash?</b></summary>
@@ -206,6 +227,18 @@ the most useful file to read if you want to know exactly what is pulled off disk
 | Codex | `~/.codex/sessions/**/*.jsonl` |
 | Kimi | `~/.kimi/**/wire.jsonl` |
 | OpenCode | OTLP export |
+
+### Historical Claude Code activity
+
+`vibecom rescan` can import only the Claude Code transcripts that are still on
+your machine. It does not fetch conversation history from your Anthropic
+account, and it cannot include Claude web or desktop activity.
+
+Claude Code keeps its local transcripts in `~/.claude/projects/` for 30 days by
+default (configurable through Claude Code's `cleanupPeriodDays` setting). If
+older transcripts were pruned, moved during a migration, or live only in an old
+machine or backup, their activity cannot be backfilled until that archive is
+available locally. See [Anthropic's data-retention documentation](https://code.claude.com/docs/en/data-usage).
 
 ---
 

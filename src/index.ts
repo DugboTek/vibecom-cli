@@ -27,6 +27,10 @@ import {
   discoverRepos,
   ensureExcluded,
   ensureGitignored,
+  linkRepo,
+  type LinkResult,
+  SCAN_VERSION,
+  invalidateGlobalScanMarks,
   listWorktrees,
   projectRoot,
   readProjectToken,
@@ -37,6 +41,8 @@ import {
   globalTrackingOn,
   removeGlobalSettings,
   writeGlobalSettings,
+  writeCodexSettings,
+  removeCodexSettings,
   recommendedRepos,
   readScanMarks,
   sendRepoStats,
@@ -74,7 +80,34 @@ import {
   transcriptSources,
   type SessionUsage,
 } from "./transcripts";
-import { collectRepoStats } from "./gitStats";
+import { hostedSessionUsages } from "./hostSessions";
+import { runCodexAppServerProxy } from "./appServerBridge";
+import {
+  installSuperconductorCodexBridge,
+  superconductorBridgeInstalled,
+} from "./superconductor";
+import { aggregateUncoveredRepos, collectRepoStats } from "./gitStats";
+import {
+  DEFAULT_AUTOPILOT,
+  type AutopilotConfig,
+  claudeSettingsPath,
+  describeAction,
+  installSessionHook,
+  markScanned,
+  readAutopilot,
+  isSlotStale,
+  markSlotStale,
+  removeSessionHook,
+  runAutopilot,
+  scanDue,
+  installScanAgent,
+  removeScanAgent,
+  scanAgentInstalled,
+  sessionHookInstalled,
+  uncoveredEverywhere,
+  writeAutopilot,
+} from "./autopilot";
+import { spawn } from "node:child_process";
 import { playReel, reelFrames } from "./reel";
 import { runDemo } from "./demo";
 /* Status glyphs come from clack — its log helpers and spinner.stop prefix
@@ -211,15 +244,56 @@ async function repairOriginDrift(cred: Credentials): Promise<void> {
       .catch(() => undefined);
     deleteSlot(GLOBAL_SLOT_ROOT);
     removeGlobalSettings();
+    removeCodexSettings();
     await linkGlobal(cred, cred.origin);
   }
 
   const projects = stale.filter((slot) => slot.root !== GLOBAL_SLOT_ROOT);
+  if (projects.length === 0) return;
+
+  /* Re-point rather than warn. Telling somebody to unlink twenty-five projects
+     by hand is not a fix — it is a list of chores whose only outcome is losing
+     the per-project attribution they were linked for. The salt and root are
+     reused deliberately: projectIdFor(salt, root) is unchanged, so the new
+     token carries the same project id and the history already recorded under it
+     stays that project's history. */
+  const spin = p.spinner();
+  spin.start(`re-pointing ${projects.length} project(s) at ${cred.origin}`);
+  const stuck: string[] = [];
+  let moved = 0;
+
   for (const slot of projects) {
-    p.log.warn(
-      `${pc.bold(slot.label)} still reports to ${pc.dim(slot.origin)} — ` +
-        `choose "Stop collecting from a project" to drop it`
-    );
+    try {
+      const minted = await mintProjectToken(cred.origin, cred.token, {
+        projectId: slot.projectId,
+        projectLabel: slot.label,
+        tier: slot.tier,
+      });
+      const trees = listWorktrees(slot.root);
+      for (const tree of trees) prepareProjectSettings(tree);
+      for (const tree of trees) {
+        writeProjectSettings(tree, cred.origin, minted.access_token);
+      }
+      writeSlot({ ...slot, origin: cred.origin });
+      /* Only once the new credential is in place. A token revoked before its
+         replacement lands would leave that project reporting nowhere. */
+      await revokeProjectToken(slot.origin, cred.token, slot.projectId).catch(
+        () => undefined
+      );
+      moved += 1;
+    } catch {
+      /* Leave the slot untouched. It still reports to the old origin, which is
+         worse than being current but far better than being broken. */
+      stuck.push(slot.label);
+    }
+  }
+
+  spin.stop(
+    `${moved} project(s) now report to ${pc.cyan(cred.origin)}` +
+      (stuck.length > 0 ? pc.yellow(`  ${stuck.length} could not be moved`) : "")
+  );
+  for (const label of stuck) {
+    p.log.warn(`${pc.bold(label)} still reports to its old host — run vibecom doctor`);
   }
 }
 
@@ -362,63 +436,32 @@ async function applyLinks(
   let count = 0;
   for (const repo of selected) {
     spin.start(`linking ${repo.label}`);
-    const salt = repo.linked?.salt ?? newSalt();
-    const projectId = projectIdFor(salt, repo.root);
-    const trees = listWorktrees(repo.root);
-    let added = false;
+    /* linkRepo owns the whole grant: ignore preflight, mint, write to every
+       checkout, roll the token back if any of it fails, and invalidate the
+       machine-wide scan marks so work already imported under "all projects"
+       gets re-attributed to this project. This used to be a second copy of
+       that sequence, which meant links made through the wizard silently
+       skipped the invalidation — the attribution they were created to fix
+       stayed frozen exactly where it was wrong. */
+    let result: LinkResult;
     try {
-      // Establish and verify ignore protection before the server creates a
-      // bearer token or any checkout receives it.
-      added = ensureGitignored(repo.root);
-      ensureExcluded(repo.root);
-      for (const tree of trees) prepareProjectSettings(tree);
+      result = await linkRepo(
+        origin,
+        cred.token,
+        { root: repo.root, label: repo.label, salt: repo.linked?.salt },
+        tier
+      );
     } catch (error) {
       spin.stop(
         bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
       );
       continue;
     }
-    let token: string;
-    try {
-      token = (
-        await mintProjectToken(origin, cred.token, {
-          projectId,
-          projectLabel: repo.label,
-          tier,
-        })
-      ).access_token;
-    } catch (e) {
-      spin.stop(bad(`${repo.label}: ${e instanceof Error ? e.message : e}`));
-      continue;
-    }
-    /* Every checkout gets the config, not just the one we are standing in.
-       A worktree starts with no .claude/settings.local.json — the file is
-       gitignored, so `git worktree add` never copies it — and agent tools do
-       all their work in worktrees. Covering only the main checkout would mean
-       tracking almost nothing, silently. */
-    try {
-      for (const tree of trees) writeProjectSettings(tree, origin, token);
-    } catch (error) {
-      await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
-      spin.stop(
-        bad(`${repo.label}: ${error instanceof Error ? error.message : error}`)
-      );
-      continue;
-    }
-    writeSlot({
-      root: repo.root,
-      salt,
-      projectId,
-      tier,
-      label: repo.label,
-      origin,
-      linkedAt: new Date().toISOString(),
-    });
-    const extra = trees.length - 1;
+    const extra = result.worktrees.length - 1;
     spin.stop(
-      `${pc.bold(repo.label)} ${pc.dim("→")} ${projectId.slice(0, 12)}…` +
+      `${pc.bold(repo.label)} ${pc.dim("→")} ${result.slot.projectId.slice(0, 12)}…` +
         (extra > 0 ? pc.dim(`  +${extra} worktree${extra === 1 ? "" : "s"}`) : "") +
-        (added ? pc.dim("  (+.gitignore)") : "")
+        (result.gitignoreAdded ? pc.dim("  (+.gitignore)") : "")
     );
     count++;
   }
@@ -534,6 +577,9 @@ async function linkGlobal(cred: Credentials, origin: string): Promise<boolean> {
   }
   try {
     writeGlobalSettings(origin, token);
+    /* Same token, same origin, written from the one place it is issued —
+       so a re-mint can never leave Codex holding a revoked credential. */
+    writeCodexSettings(origin, token);
   } catch (error) {
     await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
     spin.stop(bad(error instanceof Error ? error.message : String(error)));
@@ -612,6 +658,19 @@ async function quickStart(cred: Credentials, searchDir: string): Promise<number>
         "Fix the problem above, then run vibecom again."
     );
     return 0;
+  }
+  /* Whole-machine tracking is the opt-out choice the builder just confirmed.
+     Install the one-time plumbing now, rather than leaving a successful setup
+     dependent on a later `autopilot on` command. A linked global slot still
+     works if a local settings file needs attention, so surface that narrowly
+     and continue with the historical import. */
+  try {
+    enableAutopilot({ ...readAutopilot(), enabled: true });
+  } catch (error) {
+    p.log.warn(
+      "Automatic collection needs attention — run `vibecom autopilot on`: " +
+        (error instanceof Error ? error.message : String(error))
+    );
   }
   const count = 1;
   void searchDir;
@@ -714,6 +773,23 @@ async function runScan(
   tokens: number;
   days: string[];
 }> {
+  /* Superconductor regenerates its provider wrappers during some app updates.
+     Repair the narrow Codex bridge before a scheduled scan, so opt-out
+     tracking does not quietly lose a new app-server session. */
+  const autopilot = readAutopilot();
+  if (autopilot.enabled) {
+    /* A CLI update replaces the executable but cannot retroactively install a
+       launchd job. Repair it during the first scan, which is idempotent and
+       ensures the next scan happens without the builder remembering a command.
+       The collector is provider-neutral; the Claude session hook is not needed
+       for archive-based Claude/Codex/Kimi accounting. */
+    if (autopilot.scan && !scanAgentInstalled()) {
+      installScanAgent(hookBinary(), autopilot.scanIntervalMinutes);
+    }
+    if (!superconductorBridgeInstalled()) {
+      installSuperconductorCodexBridge(hookBinary());
+    }
+  }
   const slots = listSlots();
   if (slots.length === 0)
     return {
@@ -764,6 +840,11 @@ async function runScan(
       parsed.push(usage);
   }
 
+  /* Desktop hosts such as Conductor own their agent conversations rather than
+     writing the provider's ordinary archive. Their adapters return only safe
+     metadata, so a Codex/Claude session counts whichever app launched it. */
+  parsed.push(...hostedSessionUsages());
+
   /* Claude resumes replay records with stable message ids, while Claude/Kimi
      child agents write separate wires that are real additional work. The
      transcript module knows those formats and merges each execution tree
@@ -773,6 +854,10 @@ async function runScan(
   const byProject = new Map<string, { usage: SessionUsage; key: string }[]>();
   let skipped = 0;
   const byTool: Record<string, number> = {};
+  /* Every repository a session actually ran in, whether or not it is linked.
+     The machine-wide slot has no directory of its own, so this is the only
+     record of which repositories exist to read git counters from. */
+  const seenRoots = new Set<string>();
 
   for (const usage of grouped) {
     const key = `${usage.tool}:${usage.sessionId}`;
@@ -781,7 +866,7 @@ async function runScan(
       !full &&
       mark &&
       mark.activityVersion === 1 &&
-      mark.scanVersion === 2 &&
+      mark.scanVersion === SCAN_VERSION &&
       mark.file === usage.file &&
       mark.lines === usage.lines &&
       mark.mtimeMs === usage.mtimeMs
@@ -792,6 +877,7 @@ async function runScan(
     if (!usage.model && mark?.model) usage.model = mark.model;
     const cwd = usage.cwd ?? kimiDirs.get(usage.sessionId) ?? null;
     const root = cwd ? projectRoot(cwd) : null;
+    if (root) seenRoots.add(root);
     /* The machine-wide slot has no directory of its own, so it can never win
        a path comparison. Without it as the fallback every session lands in
        "unlinked projects — ignored" and the import quietly does nothing while
@@ -853,6 +939,14 @@ async function runScan(
         ? readGlobalToken()
         : readProjectToken(slot.root);
     if (!token) continue;
+    /* A slot the server has revoked is consent withdrawn, not a broken file.
+       Re-sending would keep asking a door that has been closed, and falling
+       back to the machine-wide slot would route this project's work somewhere
+       the person did not agree to. Skip it and say so. */
+    if (isSlotStale(slot.root)) {
+      failed.add(`${slot.label}: access was revoked — run vibecom doctor`);
+      continue;
+    }
     for (let i = 0; i < list.length; i += 50) {
       const batch = list.slice(i, i + 50);
       try {
@@ -880,6 +974,13 @@ async function runScan(
         sessions += batch.length;
         for (const b of batch) marks[b.key] = markFor(b.usage, slot.root);
       } catch (e) {
+        /* 401/403 is the server saying this credential is no longer valid.
+           Recording it stops the next scan re-trying a revoked token, and
+           stops autopilot quietly minting a replacement for consent that was
+           deliberately withdrawn. */
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          markSlotStale(slot.root);
+        }
         // one line per project, not per batch
         failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
       }
@@ -892,7 +993,7 @@ async function runScan(
      sessions. Commits land without a transcript all the time — a rebase, a
      merge, work done outside any AI tool — so gating this on transcript
      activity would leave the counters permanently stale. */
-  const repos = await sendGitStats(slots, failed);
+  const repos = await sendGitStats(slots, failed, seenRoots);
 
   return {
     sent,
@@ -915,12 +1016,67 @@ async function runScan(
  * server replaces the previous copy instead of adding to it, so a corrected
  * count converges rather than compounding.
  */
-async function sendGitStats(
-  slots: ProjectSlot[],
+/**
+ * Read git counters for the machine-wide slot.
+ *
+ * `*` is not a directory, so the per-project path cannot serve it: there is no
+ * settings file to read a token from and no repository to count. Left alone,
+ * anyone who took the default onboarding got tokens and cost but never a
+ * single commit, line or pull request — the craft half of every profile was
+ * silently zero.
+ *
+ * Two constraints shape this. Repositories that carry their own slot are
+ * excluded, because the server sums `GROUP BY (userId, metricType)` and a
+ * repository counted under both its own project id and the machine-wide one
+ * would double every commit it contains. And what remains is summed into a
+ * single record rather than sent per repository, because each record is a
+ * snapshot that replaces its `(projectId, source)` scope — sending five under
+ * one token would have them delete each other, leaving whichever landed last.
+ * One bucket, one total, which is what "all projects" already means everywhere
+ * else.
+ */
+async function sendGlobalGitStats(
+  slot: ProjectSlot,
+  covered: Set<string>,
+  roots: Set<string>,
   failed: Set<string>
 ): Promise<number> {
+  const token = readGlobalToken();
+  if (!token) return 0;
+
+  const { total, counted } = aggregateUncoveredRepos(roots, covered, (root) =>
+    collectRepoStats(root, null)
+  );
+  if (counted === 0) return 0;
+
+  try {
+    await sendRepoStats(slot.origin, token, [total]);
+    return 1;
+  } catch (e) {
+    failed.add(`all projects: ${e instanceof Error ? e.message : e}`);
+    return 0;
+  }
+}
+
+async function sendGitStats(
+  slots: ProjectSlot[],
+  failed: Set<string>,
+  seenRoots: Set<string> = new Set()
+): Promise<number> {
   let sent = 0;
-  for (const slot of slots) {
+  const globalSlot = slots.find((s) => s.root === GLOBAL_SLOT_ROOT);
+  const projectSlots = slots.filter((s) => s.root !== GLOBAL_SLOT_ROOT);
+
+  if (globalSlot) {
+    sent += await sendGlobalGitStats(
+      globalSlot,
+      new Set(projectSlots.map((s) => s.root)),
+      seenRoots,
+      failed
+    );
+  }
+
+  for (const slot of projectSlots) {
     const token = readProjectToken(slot.root);
     if (!token) continue;
 
@@ -942,6 +1098,9 @@ async function sendGitStats(
       await sendRepoStats(slot.origin, token, [stats]);
       sent += 1;
     } catch (e) {
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+        markSlotStale(slot.root);
+      }
       failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
     }
   }
@@ -964,7 +1123,7 @@ function markFor(u: SessionUsage, root: string, model?: string | null) {
     root,
     model: u.model ?? model ?? null,
     activityVersion: 1 as const,
-    scanVersion: 2 as const,
+    scanVersion: SCAN_VERSION,
   };
 }
 
@@ -1379,6 +1538,7 @@ async function doUnlink(cred: Credentials, slot: ProjectSlot) {
        Claude Code's user-level settings, so leaving it behind would keep
        pointing every project at a token that was just revoked. */
     removeGlobalSettings();
+    removeCodexSettings();
   } else {
     // strip every checkout, or a stale worktree keeps a now-revoked token on disk
     const trees = listWorktrees(slot.root);
@@ -1617,6 +1777,242 @@ async function help() {
   console.log();
 }
 
+/* ============================================================ autopilot === */
+
+/**
+ * Absolute path of the binary a hook should invoke.
+ *
+ * The installed bin carries its own shebang, so pointing at it survives a Node
+ * upgrade that would invalidate a hard-coded interpreter path. Running from a
+ * build directory resolves to the installed copy instead, so a hook does not
+ * break the moment that checkout moves.
+ */
+function hookBinary(): string {
+  const script = process.argv[1] ? path.resolve(process.argv[1]) : "";
+  const named = (file: string) =>
+    path.basename(file).replace(/\.[^.]+$/, "") === "vibecom";
+  if (script && named(script)) return script;
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "vibecom");
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+  return script || "vibecom";
+}
+
+/**
+ * The tier this builder has already chosen most often.
+ *
+ * An unattended link must not quietly collect more than the linked projects
+ * beside it, nor pointlessly less. Matching the prevailing choice is the only
+ * default that needs no explanation when the recap is read back.
+ */
+function prevailingTier(): 1 | 2 | 3 {
+  const counts = new Map<1 | 2 | 3, number>();
+  for (const slot of listSlots()) {
+    counts.set(slot.tier, (counts.get(slot.tier) ?? 0) + 1);
+  }
+  let best = DEFAULT_AUTOPILOT.tier;
+  let seen = 0;
+  for (const [tier, count] of counts) {
+    if (count > seen) {
+      best = tier;
+      seen = count;
+    }
+  }
+  return best;
+}
+
+function enableAutopilot(config = readAutopilot()): {
+  config: AutopilotConfig;
+  backup: string | null;
+  bridgeInstalled: boolean;
+} {
+  const next: AutopilotConfig = {
+    ...config,
+    enabled: true,
+    tier: config.enabled ? config.tier : prevailingTier(),
+  };
+  const { backup } = installSessionHook(hookBinary());
+  if (next.scan) installScanAgent(hookBinary(), next.scanIntervalMinutes);
+  const bridge = installSuperconductorCodexBridge(hookBinary());
+  writeAutopilot(next);
+  return { config: next, backup, bridgeInstalled: bridge.installed };
+}
+
+function reportAutopilot(config: AutopilotConfig) {
+  const installed = sessionHookInstalled();
+  const collectorInstalled = scanAgentInstalled();
+  const superconductorInstalled = superconductorBridgeInstalled();
+  const live = config.enabled && installed && (!config.scan || collectorInstalled);
+  console.log(bullet((live ? plus : minus)(`autopilot ${live ? "on" : "off"}`)));
+  if (config.enabled && !installed) {
+    p.log.warn(
+      `enabled, but no session hook in ${claudeSettingsPath()} — run ${pc.bold("vibecom autopilot on")}`
+    );
+  }
+  if (config.enabled && config.scan && !collectorInstalled) {
+    p.log.warn(
+      "enabled, but the all-provider collector is missing — run " +
+        pc.bold("vibecom autopilot on")
+    );
+  }
+  console.log(
+    bullet(
+      pc.dim(
+        `   new checkouts of a linked project  ${config.enabled ? "covered automatically" : "need vibecom sync"}`
+      )
+    )
+  );
+  if (superconductorInstalled) {
+    console.log(bullet(pc.dim("   Superconductor Codex app-server  counter bridge on")));
+  }
+  console.log(
+    bullet(
+      pc.dim(
+        `   repos owned by you or a trusted owner  ${
+          config.enabled && config.autoLink
+            ? `linked automatically at ${tierSwatch(config.tier)} tier ${config.tier}`
+            : "need vibecom link"
+        }`
+      )
+    )
+  );
+  console.log(
+    bullet(
+      pc.dim(
+        `   Claude, Codex and Kimi counters  ${
+          config.enabled && config.scan && collectorInstalled
+            ? `scanned in the background every ${config.scanIntervalMinutes}m`
+            : "need vibecom scan"
+        }`
+      )
+    )
+  );
+}
+
+async function autopilot(args: string[]): Promise<void> {
+  const sub = (args[0] ?? "").toLowerCase();
+  const config = readAutopilot();
+
+  if (sub === "off") {
+    writeAutopilot({ ...config, enabled: false });
+    const removed = removeSessionHook();
+    const collectorRemoved = removeScanAgent();
+    p.log.success(
+      removed ? "autopilot off — session hook removed" : "autopilot off"
+    );
+    if (collectorRemoved) p.log.info("all-provider background collector removed");
+    p.log.info("linked projects keep reporting; nothing new is connected");
+    return;
+  }
+
+  if (sub === "on") {
+    const enabled = enableAutopilot(config);
+    p.log.success(`autopilot on — tier ${enabled.config.tier}`);
+    if (enabled.backup) p.log.info(`settings backed up to ${enabled.backup}`);
+    if (enabled.bridgeInstalled) p.log.info("Superconductor Codex counter bridge ready for new app-server sessions");
+    reportAutopilot(enabled.config);
+    return;
+  }
+
+  if (sub === "status" || sub === "") {
+    p.intro(gradient("  autopilot  "));
+    reportAutopilot(config);
+    const gaps = uncoveredEverywhere(listSlots());
+    if (gaps.length > 0) {
+      console.log();
+      console.log(rule("checkouts not yet reporting"));
+      for (const gap of gaps) {
+        console.log(
+          bullet(
+            `${pc.bold(gap.label)} ${pc.dim(`— ${gap.missing.length} checkout${gap.missing.length === 1 ? "" : "s"}`)}`
+          )
+        );
+      }
+    }
+    p.outro(
+      pc.dim(
+        `${pc.bold("vibecom autopilot on")} to enable, ${pc.bold("off")} to stop`
+      )
+    );
+    return;
+  }
+
+  die("usage: vibecom autopilot [on|off|status]");
+}
+
+/* ================================================================= hook === */
+
+/** Read the hook payload without hanging when nothing is piped in. */
+function readHookInput(): { cwd?: string } {
+  if (process.stdin.isTTY) return {};
+  try {
+    return JSON.parse(fs.readFileSync(0, "utf8")) as { cwd?: string };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Start an incremental scan that outlives this hook.
+ *
+ * OTLP env vars are read once at process start, so the session that triggers a
+ * fresh link can never be made to export — its transcript on disk is the only
+ * record it ever leaves. Scanning here is what stops the first session in a new
+ * checkout from being the one session that is always lost. It is also the only
+ * path that carries Codex, Kimi and the git counters at all.
+ */
+function kickBackgroundScan(): void {
+  const script = process.argv[1];
+  if (!script) return;
+  markScanned();
+  const child = spawn(process.execPath, [path.resolve(script), "scan"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+/**
+ * `vibecom hook` — the SessionStart handler.
+ *
+ * Exits 0 whatever happens. A non-zero exit here paints an error over a screen
+ * the builder is trying to work on, and there is nothing this hook could fail
+ * at that is worth interrupting them for.
+ */
+async function sessionHook(): Promise<void> {
+  const config = readAutopilot();
+  let notice: string | null = null;
+  try {
+    const input = readHookInput();
+    notice = describeAction(
+      await runAutopilot(input.cwd ?? process.cwd(), {
+        credentials: readCredentials(),
+        config,
+      })
+    );
+  } catch {
+    /* Wiring up failed — the background scan below still recovers this
+       session's usage from its transcript, so stay quiet and carry on. */
+  }
+  try {
+    if (config.enabled && scanDue(config)) kickBackgroundScan();
+  } catch {
+    // a scan that could not start is not worth a word on screen
+  }
+  if (notice) {
+    process.stdout.write(
+      JSON.stringify({ systemMessage: notice, suppressOutput: true }) + "\n"
+    );
+  }
+}
+
 const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
   login: async () => {
     await banner("the community for AI builders");
@@ -1703,8 +2099,13 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     }
     p.outro(pc.dim("your calendar and clock now reflect when you worked"));
   },
-  scan: async () => {
+  scan: async (args) => {
     requireLogin();
+    const quiet = args.includes("--quiet");
+    if (quiet) {
+      await runScan(false);
+      return;
+    }
     p.intro(gradient("  scan  "));
     const progress = { label: "reading transcripts from Claude Code, Codex and Kimi" };
     const r = await pulse(progress, runScan(false, progress));
@@ -1733,6 +2134,21 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
       );
     }
     p.outro(pc.dim("covers sessions already running; no restart needed"));
+  },
+  autopilot: async (args) => autopilot(args),
+  /* Machine-facing, so it is deliberately absent from `help`: Claude Code
+     invokes it with the SessionStart payload on stdin. */
+  hook: async () => sessionHook(),
+  /* Invoked only by Superconductor's managed Codex wrapper. The protocol
+     proxy handles no human input itself; it forwards JSON-RPC byte-for-byte. */
+  "codex-app-server": async (args) => {
+    const separator = args.indexOf("--");
+    const realFlag = args.indexOf("--real");
+    const real = realFlag >= 0 ? args[realFlag + 1] : undefined;
+    if (!real || separator < 0 || separator <= realFlag + 1) {
+      throw new Error("usage: vibecom codex-app-server --real <binary> -- <args>");
+    }
+    process.exitCode = await runCodexAppServerProxy(real, args.slice(separator + 1));
   },
   sync: async () => {
     p.intro(gradient("  sync  "));
