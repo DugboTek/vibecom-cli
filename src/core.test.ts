@@ -17,6 +17,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 import {
+  ApiError,
   CONFIG_DIR,
   EXCLUDED_FILE,
   GLOBAL_SLOT_ROOT,
@@ -223,7 +224,7 @@ test("corrupt settings.local.json does not throw or lose the link", () => {
   fs.writeFileSync(file, "{ this is not json");
   writeProjectSettings(dir, "https://vibecom.build", "tok");
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "1");
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "0");
 });
 
 test("settings writes refuse symlinked paths", () => {
@@ -929,7 +930,7 @@ test("removeExclusionSettings drops only the key it wrote", () => {
   assert.equal(data.env.KEEP, "1", "unrelated env was not touched");
 });
 
-test("removeExclusionSettings leaves a real project link's telemetry=1 alone", () => {
+test("removeExclusionSettings preserves an archive collector's project link", () => {
   // A repo un-excluded and then linked legitimately carries "1", written by
   // writeProjectSettings — that value is not removeExclusionSettings's to
   // touch, or a stale un-exclude could silently turn a live link off.
@@ -937,11 +938,52 @@ test("removeExclusionSettings leaves a real project link's telemetry=1 alone", (
   writeProjectSettings(dir, "https://vibecom.build", "tok");
   removeExclusionSettings(dir);
   const data = JSON.parse(fs.readFileSync(settingsPathFor(dir), "utf8"));
-  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "1");
+  assert.equal(data.env.CLAUDE_CODE_ENABLE_TELEMETRY, "0");
 });
 
 test("removeExclusionSettings on a checkout that was never excluded does nothing", () => {
   const dir = repo("exclusion-remove-absent");
   assert.doesNotThrow(() => removeExclusionSettings(dir));
   assert.equal(fs.existsSync(settingsPathFor(dir)), false);
+});
+
+test("oversized scans retry whole sessions, preserving model and hourly records", async () => {
+  const original = globalThis.fetch;
+  const batches: string[][] = [];
+  globalThis.fetch = (async (_input, init) => {
+    const records = JSON.parse(String(init?.body)).resourceLogs[0].scopeLogs[0].logRecords;
+    const ids = records.map((record: { attributes: { key: string; value: { stringValue: string } }[] }) =>
+      record.attributes.find((attribute) => attribute.key === "session.id")!.value.stringValue);
+    batches.push(ids);
+    const unique = new Set(ids);
+    if (unique.size > 1) return Response.json({ error: "payload too large" }, { status: 413 });
+    return Response.json({ accepted: records.length, dropped: 0 });
+  }) as typeof fetch;
+  const session = (sessionId: string) => ({ tool: "codex", sessionId, model: "gpt-5", turns: 1,
+    inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheCreationTokens: 0,
+    costUsd: 0.1, unpricedTokens: 0,
+    activity: [{ bucketAtMs: 0, seconds: 20 }, { bucketAtMs: 3600000, seconds: 30 }] });
+  try {
+    const result = await sendScanned("https://example.com", "tok", [session("one"), session("two")]);
+    assert.deepEqual(batches, [["one", "two", "one", "one", "two", "two"], ["one", "one", "one"], ["two", "two", "two"]]);
+    assert.equal(result.accepted, 6);
+  } finally { globalThis.fetch = original; }
+});
+
+test("a single oversized session fails so its watermark cannot advance", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => Response.json({ error: "payload too large" }, { status: 413 })) as typeof fetch;
+  try {
+    await assert.rejects(sendScanned("https://example.com", "tok", [{ tool: "codex", sessionId: "one", model: null,
+      turns: 1, inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+      costUsd: 0, unpricedTokens: 0, activity: [] }]), (error: unknown) => error instanceof ApiError && error.status === 413);
+  } finally { globalThis.fetch = original; }
+});
+
+test("legacy successful truncation is refused instead of marking lost tokens as sent", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => Response.json({ accepted: 1, dropped: 0 }, { status: 202, headers: { "x-vibecom-truncated": "true" } })) as typeof fetch;
+  try {
+    await assert.rejects(sendScanned("https://example.com", "tok", []), (error: unknown) => error instanceof ApiError && error.status === 413);
+  } finally { globalThis.fetch = original; }
 });

@@ -185,8 +185,9 @@ top of the installer.
 
 When you opt into `vibecom autopilot on` on macOS, the CLI also installs a
 private per-user LaunchAgent that runs `vibecom scan --quiet` at the configured
-interval (five minutes for a new setup). This is how **Claude Code, Codex, and
-Kimi** all stay current when they write their normal local archives, regardless
+interval (thirty minutes for a new setup; `vibecom scan` refreshes immediately).
+The CLI disables its own continuous exporters while retaining the archive-upload
+credentials. This is how **Claude Code, Codex, and Kimi** all stay current when they write their normal local archives, regardless
 of which terminal app launched them. It is not a process monitor and it does
 not read the screen, terminal scrollback, or a chat transcript beyond the
 counter fields described above.

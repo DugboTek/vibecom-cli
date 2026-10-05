@@ -63,10 +63,10 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   tier: 1,
   autoLink: true,
   scan: true,
-  /* A running chat keeps appending usage to its local archive. Five minutes is
-     short enough for the activity page to feel live, without repeatedly
-     walking a large archive while someone is actively coding. */
-  scanIntervalMinutes: 5,
+  /* Archive snapshots retain every token without a continuous database wakeup.
+     Thirty-minute batching gives a small serverless database room to sleep.
+     Manual `scan` remains available for an immediate refresh. */
+  scanIntervalMinutes: 30,
 };
 
 const asTier = (value: unknown): 1 | 2 | 3 =>
@@ -487,16 +487,32 @@ function xml(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
-export function scanAgentPlist(binary: string, intervalMinutes: number): string {
+export function scanAgentPlist(
+  binary: string,
+  intervalMinutes: number,
+  nodeBinary = process.execPath
+): string {
+  if (!path.isAbsolute(binary) || !path.isAbsolute(nodeBinary)) {
+    throw new Error("collector and Node binaries must be absolute paths");
+  }
   const intervalSeconds = Math.max(60, Math.round(intervalMinutes * 60));
   const log = path.join(CONFIG_DIR, "collector.log");
+  // launchd never sources the shell's NVM/Homebrew setup. Execute the Node
+  // that installed us directly, and give child git processes a bounded PATH.
+  const collectorPath = [...new Set([
+    path.dirname(nodeBinary), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+  ])].join(":");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${SCAN_AGENT_LABEL}</string>
   <key>ProgramArguments</key><array>
+    <string>${xml(nodeBinary)}</string>
     <string>${xml(binary)}</string><string>scan</string><string>--quiet</string>
   </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${xml(collectorPath)}</string>
+  </dict>
   <key>StartInterval</key><integer>${intervalSeconds}</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xml(log)}</string>
@@ -564,5 +580,17 @@ export function removeScanAgent(
   }
 }
 
-export const scanAgentInstalled = (home = os.homedir()): boolean =>
-  fs.existsSync(scanAgentPath(home));
+/** A legacy env-node plist exists on disk but cannot run under launchd. */
+export function scanAgentInstalled(home = os.homedir(), nodeBinary = process.execPath): boolean {
+  try {
+    const file = scanAgentPath(home);
+    if (!fs.lstatSync(file).isFile()) return false;
+    const plist = fs.readFileSync(file, "utf8");
+    return plist.includes(`<string>${xml(nodeBinary)}</string>`) &&
+      plist.includes("<key>PATH</key>") &&
+      plist.includes("<string>scan</string>") &&
+      plist.includes("<string>--quiet</string>");
+  } catch {
+    return false;
+  }
+}

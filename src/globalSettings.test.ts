@@ -152,3 +152,31 @@ test("an http origin is still refused for whole-machine tracking", () => {
   assert.match(out, /REFUSED:.*HTTPS/);
   assert.doesNotMatch(out, /WROTE/);
 });
+
+test("archive collection preserves tokens and unrelated settings while disabling only our exporter", () => {
+  const out = inHome((home) => {
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ model: "opus", env: {
+      OTEL_EXPORTER_OTLP_ENDPOINT: "https://example.com/api", OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer retained",
+      CLAUDE_CODE_ENABLE_TELEMETRY: "1", EXTRA: "keep" } }));
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".codex", "config.toml"), 'model = "gpt-5"\n[otel]\nexporter = { otlp-http = { endpoint = "https://example.com/api/v1/logs", protocol = "json", headers = { "Authorization" = "Bearer retained" } } }\n');
+  }, `core.enableArchiveCollection("https://example.com");
+      console.log("TOKEN:" + core.readGlobalToken());
+      const config = JSON.parse(fs.readFileSync(settings, "utf8"));
+      console.log("STATE:" + config.env.CLAUDE_CODE_ENABLE_TELEMETRY + "|" + config.env.OTEL_METRICS_EXPORTER + "|" + config.env.EXTRA + "|" + config.model);
+      console.log("CODEX:" + fs.readFileSync(core.CODEX_CONFIG_FILE, "utf8"));`);
+  assert.match(out, /TOKEN:retained/);
+  assert.match(out, /STATE:0\|none\|keep\|opus/);
+  assert.match(out, /model = "gpt-5"/);
+  assert.doesNotMatch(out, /exporter =/);
+});
+
+test("archive migration leaves another provider's telemetry untouched", () => {
+  const out = inHome((home) => {
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: {
+      OTEL_EXPORTER_OTLP_ENDPOINT: "https://other.example/api", OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer other",
+      CLAUDE_CODE_ENABLE_TELEMETRY: "1" } }));
+  }, `const before = fs.readFileSync(settings, "utf8"); core.enableArchiveCollection("https://example.com");
+      console.log("UNCHANGED:" + (before === fs.readFileSync(settings, "utf8")));`);
+  assert.match(out, /UNCHANGED:true/);
+});

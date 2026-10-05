@@ -14,6 +14,11 @@
 It reads the session transcripts your coding tools already write to disk,
 adds up the numbers, and sends counters. Nothing else.
 
+New macOS setups collect in 30-minute batches so the database can sleep between
+uploads. `vibecom scan` refreshes immediately. The collector disables its own
+continuous Claude/Codex exporters and keeps their credentials for archive uploads;
+already running tool sessions pick up this change on their next restart.
+
 [![ci](https://github.com/DugboTek/vibecom-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/DugboTek/vibecom-cli/actions/workflows/ci.yml)
 [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 [![reproducible build](https://img.shields.io/badge/build-reproducible-brightgreen)](#reproduce-the-bundle-you-are-running)

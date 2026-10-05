@@ -25,6 +25,7 @@ import {
   readAutopilot,
   removeSessionHook,
   runAutopilot,
+  scanAgentInstalled,
   scanAgentPath,
   scanAgentPlist,
   scanDue,
@@ -147,6 +148,28 @@ test("the all-provider collector invokes only the installed CLI in quiet scan mo
     scanAgentPath("/Users/example"),
     /\/Users\/example\/Library\/LaunchAgents\/build\.vibecom\.collect\.plist$/
   );
+});
+
+test("launchd uses an absolute Node runtime without depending on shell startup", () => {
+  const plist = scanAgentPlist(
+    "/Users/A & B/.local/bin/vibecom", 5,
+    "/Users/A & B/.nvm/versions/node/v22/bin/node"
+  );
+  assert.match(plist, /<string>\/Users\/A &amp; B\/\.nvm\/versions\/node\/v22\/bin\/node<\/string>/);
+  assert.match(plist, /<key>PATH<\/key><string>\/Users\/A &amp; B\/\.nvm\/versions\/node\/v22\/bin:/);
+  assert.throws(() => scanAgentPlist("vibecom", 5), /absolute paths/);
+  assert.throws(() => scanAgentPlist("/bin/vibecom", 5, "node"), /absolute paths/);
+});
+
+test("an existing env-node schedule needs repair after upgrading the CLI", () => {
+  const home = path.join(tmp, "launchd-upgrade");
+  const file = scanAgentPath(home);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '<plist><key>ProgramArguments</key><array><string>/bin/vibecom</string><string>scan</string><string>--quiet</string></array></plist>');
+  assert.equal(scanAgentInstalled(home), false);
+  fs.writeFileSync(file, scanAgentPlist("/bin/vibecom", 30));
+  assert.equal(scanAgentInstalled(home), true);
+  assert.equal(scanAgentInstalled(home, "/new/node"), false, "changed Node installations need repair too");
 });
 
 /* ------- who may be linked without a prompt ------- */

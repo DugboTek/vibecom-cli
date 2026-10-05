@@ -41,7 +41,7 @@ import {
   globalTrackingOn,
   removeGlobalSettings,
   writeGlobalSettings,
-  writeCodexSettings,
+  enableArchiveCollection,
   removeCodexSettings,
   recommendedRepos,
   readScanMarks,
@@ -136,12 +136,12 @@ function die(message: string): never {
 }
 
 /** clack returns a cancel symbol on Ctrl-C; treat it as "abort cleanly". */
-function orExit<T>(value: T | symbol): T {
+function orExit<T>(value: T): Exclude<T, symbol> {
   if (p.isCancel(value)) {
     p.cancel("Cancelled. Nothing was changed.");
     process.exit(0);
   }
-  return value as T;
+  return value as Exclude<T, symbol>;
 }
 
 function requireLogin(): Credentials {
@@ -577,9 +577,9 @@ async function linkGlobal(cred: Credentials, origin: string): Promise<boolean> {
   }
   try {
     writeGlobalSettings(origin, token);
-    /* Same token, same origin, written from the one place it is issued —
-       so a re-mint can never leave Codex holding a revoked credential. */
-    writeCodexSettings(origin, token);
+    /* Archive uploads use this token. Disable only our old continuous
+       exporters, leaving other telemetry providers alone. */
+    enableArchiveCollection(origin);
   } catch (error) {
     await revokeProjectToken(origin, cred.token, projectId).catch(() => undefined);
     spin.stop(bad(error instanceof Error ? error.message : String(error)));
@@ -791,6 +791,9 @@ async function runScan(
     }
   }
   const slots = listSlots();
+  for (const origin of new Set(slots.map((slot) => slot.origin))) {
+    enableArchiveCollection(origin, slots.filter((slot) => slot.origin === origin && slot.root !== GLOBAL_SLOT_ROOT).flatMap((slot) => listWorktrees(slot.root)));
+  }
   if (slots.length === 0)
     return {
       sent: 0,

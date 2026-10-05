@@ -435,11 +435,23 @@ export async function sendScanned(
   );
   const logRecords = [...sessionRecords, ...activityRecords];
 
-  return request<{ accepted: number; dropped: number }>(
-    origin,
-    "/api/v1/logs",
-    json({ resourceLogs: [{ scopeLogs: [{ logRecords }] }] }, token)
-  );
+  try {
+    return await request<{ accepted: number; dropped: number }>(
+      origin,
+      "/api/v1/logs",
+      json({ resourceLogs: [{ scopeLogs: [{ logRecords }] }] }, token)
+    );
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 413 || sessions.length <= 1) {
+      throw error;
+    }
+    // Never split a session's model or hourly records: each request replaces
+    // the whole session. The scan commits watermarks only after both succeed.
+    const middle = Math.ceil(sessions.length / 2);
+    const first = await sendScanned(origin, token, sessions.slice(0, middle));
+    const second = await sendScanned(origin, token, sessions.slice(middle));
+    return { accepted: first.accepted + second.accepted, dropped: first.dropped + second.dropped };
+  }
 }
 
 /**
@@ -766,9 +778,9 @@ export function writeProjectSettings(
   ) as Record<string, string>;
 
   Object.assign(env, {
-    CLAUDE_CODE_ENABLE_TELEMETRY: "1",
-    OTEL_METRICS_EXPORTER: "otlp",
-    OTEL_LOGS_EXPORTER: "otlp",
+    CLAUDE_CODE_ENABLE_TELEMETRY: "0",
+    OTEL_METRICS_EXPORTER: "none",
+    OTEL_LOGS_EXPORTER: "none",
     OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
     OTEL_EXPORTER_OTLP_ENDPOINT: `${origin}/api`,
     OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${token}`,
@@ -862,9 +874,9 @@ export function writeGlobalSettings(origin: string, token: string): string {
     typeof data.env === "object" && data.env !== null ? data.env : {}
   ) as Record<string, string>;
   Object.assign(env, {
-    CLAUDE_CODE_ENABLE_TELEMETRY: "1",
-    OTEL_METRICS_EXPORTER: "otlp",
-    OTEL_LOGS_EXPORTER: "otlp",
+    CLAUDE_CODE_ENABLE_TELEMETRY: "0",
+    OTEL_METRICS_EXPORTER: "none",
+    OTEL_LOGS_EXPORTER: "none",
     OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
     OTEL_EXPORTER_OTLP_ENDPOINT: `${origin}/api`,
     OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${token}`,
@@ -896,6 +908,35 @@ export function readGlobalToken(): string | null {
   const header = data.env?.OTEL_EXPORTER_OTLP_HEADERS ?? "";
   const match = /Authorization=Bearer\s+(\S+)/.exec(header);
   return match?.[1] ?? null;
+}
+
+/** Switch only our existing exporters to archive collection; keep credentials. */
+export function enableArchiveCollection(origin: string, projectRoots: string[] = []): void {
+  origin = secureOrigin(origin);
+  for (const file of [GLOBAL_SETTINGS_FILE, ...projectRoots.map(settingsPathFor)]) {
+    const stat = fs.existsSync(file) ? fs.lstatSync(file) : null;
+    if (!stat || !stat.isFile() || stat.isSymbolicLink()) continue;
+    const data = readJson<{ env?: Record<string, string> }>(file, {});
+    if (data.env?.OTEL_EXPORTER_OTLP_ENDPOINT === `${origin}/api` &&
+        data.env.OTEL_EXPORTER_OTLP_HEADERS?.startsWith("Authorization=Bearer ")) {
+      if (data.env.CLAUDE_CODE_ENABLE_TELEMETRY !== "0" || data.env.OTEL_METRICS_EXPORTER !== "none" || data.env.OTEL_LOGS_EXPORTER !== "none") {
+        data.env.CLAUDE_CODE_ENABLE_TELEMETRY = "0";
+        data.env.OTEL_METRICS_EXPORTER = "none";
+        data.env.OTEL_LOGS_EXPORTER = "none";
+        writePrivateFile(file, JSON.stringify(data, null, 2) + "\n");
+      }
+    }
+  }
+  if (fs.existsSync(CODEX_CONFIG_FILE) && fs.lstatSync(CODEX_CONFIG_FILE).isFile() && !fs.lstatSync(CODEX_CONFIG_FILE).isSymbolicLink()) {
+    const body = fs.readFileSync(CODEX_CONFIG_FILE, "utf8");
+    // Match our one-line OTLP stanza only; preserve other collectors/settings.
+    const next = body.replace(/^exporter = \{ otlp-http = .*$/gm, (line) =>
+      line.includes(`endpoint = "${origin}/api/v1/logs"`) && line.includes('"Authorization" = "Bearer ')
+        ? "# vibecom uses batched local archive collection"
+        : line
+    );
+    if (next !== body) fs.writeFileSync(CODEX_CONFIG_FILE, next);
+  }
 }
 
 /** Whether whole-machine tracking is currently configured. */
@@ -1301,9 +1342,8 @@ export function writeExclusionSettings(root: string): string {
 
 /**
  * Reverse `writeExclusionSettings`. Removes only the exact key/value it
- * wrote: a project re-linked after being un-excluded legitimately carries
- * `CLAUDE_CODE_ENABLE_TELEMETRY=1` from `writeProjectSettings`, and that
- * value is not this function's to touch.
+ * wrote. A linked archive collector also disables the live exporter, but
+ * carries its own bearer header; that link is not this function's to touch.
  */
 export function removeExclusionSettings(root: string): void {
   let file: string;
@@ -1315,7 +1355,7 @@ export function removeExclusionSettings(root: string): void {
   if (!fs.existsSync(file)) return;
   const data = readJson<Record<string, unknown>>(file, {});
   const env = data.env as Record<string, string> | undefined;
-  if (!env || env.CLAUDE_CODE_ENABLE_TELEMETRY !== "0") return;
+  if (!env || env.CLAUDE_CODE_ENABLE_TELEMETRY !== "0" || env.OTEL_EXPORTER_OTLP_HEADERS) return;
   delete env.CLAUDE_CODE_ENABLE_TELEMETRY;
   if (Object.keys(env).length === 0) delete data.env;
   else data.env = env;
@@ -1426,6 +1466,11 @@ async function request<T>(
       typeof body.error === "string" ? body.error : `HTTP ${res.status}`,
       res.status
     );
+  }
+  // Older servers accepted a prefix and silently discarded the remainder.
+  // Restate complete sessions in smaller batches before advancing watermarks.
+  if (res.headers.get("x-vibecom-truncated") === "true") {
+    throw new ApiError("server truncated this batch; retry fewer complete sessions", 413);
   }
   return body as T;
 }

@@ -1,6 +1,6 @@
 {
   "name": "vibecom-cli",
-  "version": "1.0.29",
+  "version": "1.0.30",
   "description": "Privacy-first CLI that turns Codex and Claude Code activity into a verified vibecom builder profile and leaderboard rank.",
   "license": "MIT",
   "homepage": "https://www.vibecom.build/cli",
@@ -31,7 +31,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --import tsx --test src/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=2 src/*.test.ts",
     "verify": "npm test && npm run build && shasum -a 256 dist/cli.js"
   },
   "devDependencies": {
