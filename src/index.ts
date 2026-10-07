@@ -26,11 +26,9 @@ import {
   deleteSlot,
   discoverRepos,
   ensureExcluded,
-  ensureGitignored,
   linkRepo,
   type LinkResult,
   SCAN_VERSION,
-  invalidateGlobalScanMarks,
   listWorktrees,
   projectRoot,
   readProjectToken,
@@ -94,7 +92,8 @@ import {
   claudeSettingsPath,
   describeAction,
   installSessionHook,
-  markScanned,
+  claimScheduledScan,
+  kickScanAgent,
   readAutopilot,
   isSlotStale,
   markSlotStale,
@@ -1911,7 +1910,9 @@ function reportAutopilot(config: AutopilotConfig) {
       pc.dim(
         `   Claude, Codex and Kimi counters  ${
           config.enabled && config.scan && collectorInstalled
-            ? `scanned in the background every ${config.scanIntervalMinutes}m`
+            ? (config.scanIntervalMinutes === 1440
+              ? "synced once a day; recorded counters stay in the local archive"
+              : `synced every ${config.scanIntervalMinutes / 1440} days`)
             : "need vibecom scan"
         }`
       )
@@ -1992,10 +1993,15 @@ function readHookInput(): { cwd?: string } {
  * path that carries Codex, Kimi and the git counters at all.
  */
 function kickBackgroundScan(): void {
+  // macOS owns the collector schedule. Launch through that service so a
+  // configured resource wrapper is honored by session hooks as well.
+  if (process.platform === "darwin") {
+    kickScanAgent();
+    return;
+  }
   const script = process.argv[1];
   if (!script) return;
-  markScanned();
-  const child = spawn(process.execPath, [path.resolve(script), "scan"], {
+  const child = spawn(process.execPath, [path.resolve(script), "scan", "--quiet"], {
     detached: true,
     stdio: "ignore",
   });
@@ -2127,6 +2133,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<unknown>> = {
     requireLogin();
     const quiet = args.includes("--quiet");
     if (quiet) {
+      if (!claimScheduledScan(readAutopilot())) return;
       const result = await runScan(false);
       // Silence successful unattended runs, never failures. launchd's log and
       // exit status must explain why a profile has stopped receiving activity.

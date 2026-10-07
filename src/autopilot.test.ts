@@ -7,13 +7,17 @@ import {
 } from "./testSandbox";
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
 import { after, test } from "node:test";
 
 import {
   AUTOPILOT_FILE,
+  DAILY_SCAN_MINUTES,
+  claimScheduledScan,
+  upgradedScanAgentPlist,
   DEFAULT_AUTOPILOT,
   claudeSettingsPath,
   clearSlotStale,
@@ -135,7 +139,7 @@ test("a written config round-trips", () => {
   const parsed = readAutopilot();
   assert.equal(parsed.enabled, true);
   assert.equal(parsed.tier, 3);
-  assert.equal(parsed.scanIntervalMinutes, 30);
+  assert.equal(parsed.scanIntervalMinutes, DAILY_SCAN_MINUTES, "legacy cadence upgrades to daily");
   fs.rmSync(AUTOPILOT_FILE, { force: true });
 });
 
@@ -143,7 +147,7 @@ test("the all-provider collector invokes only the installed CLI in quiet scan mo
   const plist = scanAgentPlist("/Users/example/.local/bin/vibecom", 5);
   assert.match(plist, /<string>\/Users\/example\/.local\/bin\/vibecom<\/string>/);
   assert.match(plist, /<string>scan<\/string><string>--quiet<\/string>/);
-  assert.match(plist, /<key>StartInterval<\/key><integer>300<\/integer>/);
+  assert.match(plist, /<key>StartInterval<\/key><integer>86400<\/integer>/);
   assert.match(
     scanAgentPath("/Users/example"),
     /\/Users\/example\/Library\/LaunchAgents\/build\.vibecom\.collect\.plist$/
@@ -536,8 +540,56 @@ test("scans are due when none has ever run, then throttled", () => {
   assert.equal(scanDue(cfg, 1_000_000, { lastScanAt: justNow }), false);
   assert.equal(
     scanDue(cfg, 1_000_000 + 15 * 60_000, { lastScanAt: justNow }),
-    true
+    false
   );
+});
+
+test("daily attempts coalesce across hooks and the schedule, including failed attempts", () => {
+  const state = path.join(CONFIG_DIR, "autopilot-state.json");
+  fs.rmSync(state, { force: true });
+  const cfg = config({ scanIntervalMinutes: 30 });
+  const now = 1_000_000;
+  assert.equal(claimScheduledScan(cfg, now), true);
+  assert.equal(claimScheduledScan(cfg, now), false);
+  assert.equal(claimScheduledScan(cfg, now + 86_399_999), false);
+  assert.equal(claimScheduledScan(cfg, now + 86_400_000), true);
+  assert.equal(claimScheduledScan(config({ enabled: false }), now + 172_800_000), false);
+  fs.rmSync(state, { force: true });
+});
+
+test("an interrupted empty claim recovers without disturbing a fresh claim", () => {
+  const lock = path.join(CONFIG_DIR, "scheduled-scan.lock");
+  const state = path.join(CONFIG_DIR, "autopilot-state.json");
+  fs.rmSync(state, { force: true });
+  fs.writeFileSync(lock, "");
+  assert.equal(claimScheduledScan(config()), false);
+  fs.utimesSync(lock, new Date(0), new Date(0));
+  assert.equal(claimScheduledScan(config()), true);
+  fs.rmSync(state, { force: true });
+});
+
+test("two independent scheduled processes share exactly one daily attempt", async () => {
+  const state = path.join(CONFIG_DIR, "autopilot-state.json");
+  fs.rmSync(state, { force: true });
+  const script = `import * as module from ${JSON.stringify(new URL("./autopilot.ts", import.meta.url).href)};
+    const {claimScheduledScan, DEFAULT_AUTOPILOT} = module.default ?? module;
+    process.stdout.write(String(claimScheduledScan(DEFAULT_AUTOPILOT, 1000000)));`;
+  const invoke = () => promisify(execFile)(process.execPath,
+    ["--import", "tsx", "--input-type=module", "--eval", script], { env: process.env });
+  const results = await Promise.all([invoke(), invoke()]);
+  assert.deepEqual(results.map(r => r.stdout).sort(), ["false", "true"]);
+  fs.rmSync(state, { force: true });
+});
+
+test("a daily upgrade preserves a configured resource wrapper and runtime limits", () => {
+  const binary = "/Users/example/.local/bin/vibecom";
+  const wrapped = scanAgentPlist(binary, 30).replace(
+    `<string>${process.execPath}</string>`,
+    `<string>/shared/run-heavy.py</string><string>owner</string><string>${process.execPath}</string><string>--max-old-space-size=1024</string>`
+  ).replace("<integer>86400</integer>", "<integer>1800</integer>");
+  assert.equal(upgradedScanAgentPlist(wrapped, binary, 30),
+    wrapped.replace("<integer>1800</integer>", "<integer>86400</integer>"));
+  assert.match(scanAgentPlist(binary, 2880), /<integer>172800<\/integer>/);
 });
 
 test("an unparseable watermark does not wedge scanning off", () => {
@@ -585,8 +637,8 @@ test("installing preserves unrelated settings and other SessionStart hooks", () 
   assert.equal(data.model, "opus");
   assert.deepEqual(data.env, { FOO: "1" });
   assert.equal(data.hooks.Stop[0].hooks[0].command, "beep");
-  const commands = data.hooks.SessionStart.flatMap((g: any) =>
-    g.hooks.map((h: any) => h.command)
+  const commands = data.hooks.SessionStart.flatMap((g: { hooks: { command: string }[] }) =>
+    g.hooks.map((h) => h.command)
   );
   assert.deepEqual(commands, ["other-tool", "/usr/local/bin/vibecom"]);
 });
@@ -596,8 +648,8 @@ test("installing twice leaves exactly one entry", () => {
   installSessionHook("/usr/local/bin/vibecom", file);
   installSessionHook("/opt/vibecom", file);
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
-  const ours = data.hooks.SessionStart.flatMap((g: any) =>
-    g.hooks.filter((h: any) => h.args?.[0] === "hook")
+  const ours = data.hooks.SessionStart.flatMap((g: { hooks: { args?: string[] }[] }) =>
+    g.hooks.filter((h) => h.args?.[0] === "hook")
   );
   assert.equal(ours.length, 1);
   assert.equal(ours[0].command, "/opt/vibecom", "reinstall repoints the entry");
@@ -647,7 +699,7 @@ test("removing takes only our entry", () => {
   assert.equal(removeSessionHook(file), true);
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.deepEqual(
-    data.hooks.SessionStart.flatMap((g: any) => g.hooks.map((h: any) => h.command)),
+    data.hooks.SessionStart.flatMap((g: { hooks: { command: string }[] }) => g.hooks.map((h) => h.command)),
     ["other-tool"]
   );
   assert.equal(sessionHookInstalled(file), false);

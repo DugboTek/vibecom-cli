@@ -56,6 +56,8 @@ export type AutopilotConfig = {
 export const AUTOPILOT_FILE = path.join(CONFIG_DIR, "autopilot.json");
 const STATE_FILE = path.join(CONFIG_DIR, "autopilot-state.json");
 
+export const DAILY_SCAN_MINUTES = 24 * 60;
+
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   /* Tracking is opt-out: a first-time setup turns it on, and `autopilot off`
      remains the explicit, durable way to stop unattended collection. */
@@ -64,9 +66,9 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   autoLink: true,
   scan: true,
   /* Archive snapshots retain every token without a continuous database wakeup.
-     Thirty-minute batching gives a small serverless database room to sleep.
+     Daily batching keeps tracking complete without constant database wakeups.
      Manual `scan` remains available for an immediate refresh. */
-  scanIntervalMinutes: 30,
+  scanIntervalMinutes: DAILY_SCAN_MINUTES,
 };
 
 const asTier = (value: unknown): 1 | 2 | 3 =>
@@ -93,7 +95,7 @@ export function readAutopilot(): AutopilotConfig {
     scan: asBool(raw.scan, DEFAULT_AUTOPILOT.scan),
     scanIntervalMinutes:
       Number.isFinite(interval) && interval >= 0
-        ? interval
+        ? Math.max(DAILY_SCAN_MINUTES, interval)
         : DEFAULT_AUTOPILOT.scanIntervalMinutes,
   };
 }
@@ -109,10 +111,8 @@ const readState = (): AutopilotState => readJson<AutopilotState>(STATE_FILE, {})
 /**
  * Whether enough time has passed to kick another background scan.
  *
- * Opening four sessions at once must not start four scans. This is a throttle
- * rather than a lock on purpose: a lock has to survive a killed process, and
- * the failure it would prevent is benign — scans are idempotent, both against
- * the local watermarks and against the server's deterministic snapshot ids.
+ * A schedule and session hooks share the same daily attempt. Snapshot uploads
+ * remain idempotent; claimScheduledScan also coalesces concurrent triggers.
  */
 export function scanDue(
   config: AutopilotConfig,
@@ -122,12 +122,64 @@ export function scanDue(
   if (!config.scan) return false;
   const last = Date.parse(state.lastScanAt ?? "");
   if (!Number.isFinite(last)) return true;
-  return now - last >= config.scanIntervalMinutes * 60_000;
+  return now - last >= Math.max(DAILY_SCAN_MINUTES, config.scanIntervalMinutes) * 60_000;
 }
 
 export function markScanned(now = Date.now()): void {
   writeJson(STATE_FILE, { lastScanAt: new Date(now).toISOString() });
 }
+
+/** launchd and a session hook share one daily attempt, even when they race. */
+export function claimScheduledScan(config: AutopilotConfig, now = Date.now()): boolean {
+  if (!config.enabled || !scanDue(config, now)) return false;
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const lock = path.join(CONFIG_DIR, "scheduled-scan.lock");
+  let fd: number;
+  try {
+    fd = fs.openSync(lock, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const owner = readJson<{ pid?: number }>(lock, {});
+    if (!Number.isInteger(owner.pid) || !owner.pid || owner.pid < 1) {
+      // A crash between creation and the pid write must not stop tracking
+      // forever. A live claim writes its state synchronously in milliseconds.
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs < 60_000) return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return claimScheduledScan(config, now);
+        throw error;
+      }
+    } else {
+      try { process.kill(owner.pid, 0); return false; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+      }
+    }
+    fs.rmSync(lock, { force: true });
+    return claimScheduledScan(config, now);
+  }
+  try {
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }));
+    if (!scanDue(config, now)) return false;
+    markScanned(now); // failures preserve transcript watermarks and retry tomorrow
+    return true;
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+/** Upgrade just the cadence when a user has wrapped the collector runtime. */
+export function upgradedScanAgentPlist(existing: string, binary: string, intervalMinutes: number): string {
+  if (existing.includes(`<string>${xml(binary)}</string>`) &&
+      existing.includes(`<string>${xml(process.execPath)}</string>`) &&
+      existing.includes("<key>PATH</key>") && existing.includes("<string>--quiet</string>") &&
+      /<key>StartInterval<\/key>\s*<integer>\d+<\/integer>/.test(existing)) {
+    return existing.replace(/(<key>StartInterval<\/key>\s*<integer>)\d+(<\/integer>)/,
+      `$1${Math.max(DAILY_SCAN_MINUTES * 60, Math.round(intervalMinutes * 60))}$2`);
+  }
+  return scanAgentPlist(binary, intervalMinutes);
+}
+
 
 /* ------- stale (server-revoked) slots ------- */
 
@@ -495,7 +547,7 @@ export function scanAgentPlist(
   if (!path.isAbsolute(binary) || !path.isAbsolute(nodeBinary)) {
     throw new Error("collector and Node binaries must be absolute paths");
   }
-  const intervalSeconds = Math.max(60, Math.round(intervalMinutes * 60));
+  const intervalSeconds = Math.max(DAILY_SCAN_MINUTES * 60, Math.round(intervalMinutes * 60));
   const log = path.join(CONFIG_DIR, "collector.log");
   // launchd never sources the shell's NVM/Homebrew setup. Execute the Node
   // that installed us directly, and give child git processes a bounded PATH.
@@ -534,9 +586,14 @@ export function installScanAgent(
     throw new Error("collector binary must be an absolute path");
   }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, scanAgentPlist(binary, intervalMinutes), {
-    mode: 0o600,
-  });
+  let plist = scanAgentPlist(binary, intervalMinutes);
+  try {
+    const existing = fs.readFileSync(file, "utf8");
+    // Preserve a user's resource wrapper and bounded runtime arguments when
+    // upgrading cadence; an update must not bypass their local job scheduler.
+    plist = upgradedScanAgentPlist(existing, binary, intervalMinutes);
+  } catch { /* No valid prior definition; install the working runtime. */ }
+  fs.writeFileSync(file, plist, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
 
   /* `bootstrap` replaces the old launchd definition immediately. A new login
@@ -589,7 +646,8 @@ export function scanAgentInstalled(home = os.homedir(), nodeBinary = process.exe
     return plist.includes(`<string>${xml(nodeBinary)}</string>`) &&
       plist.includes("<key>PATH</key>") &&
       plist.includes("<string>scan</string>") &&
-      plist.includes("<string>--quiet</string>");
+      plist.includes("<string>--quiet</string>") &&
+      new RegExp(`<key>StartInterval</key>\\s*<integer>${Math.max(DAILY_SCAN_MINUTES * 60, Math.round(readAutopilot().scanIntervalMinutes * 60))}</integer>`).test(plist);
   } catch {
     return false;
   }
@@ -607,4 +665,15 @@ export function scanAgentLoaded(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Use the loaded service, including its resource wrapper; never kill a run. */
+export function kickScanAgent(): boolean {
+  if (process.platform !== "darwin") return false;
+  try {
+    execFileSync("/bin/launchctl", ["kickstart", `${launchDomain()}/${SCAN_AGENT_LABEL}`], {
+      stdio: "ignore", timeout: 5000,
+    });
+    return true;
+  } catch { return false; }
 }

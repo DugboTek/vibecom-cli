@@ -284,8 +284,10 @@ export type ScanMark = {
    *
    * Retain older values when reading stored marks. Version 4 restates sessions
    * that an older collector could mark complete after a truncated upload.
+   * Version 5 reprices historical sessions using the verified October rates
+   * and newly supported model IDs without adding their tokens a second time.
    */
-  scanVersion?: 2 | 3 | 4;
+  scanVersion?: 2 | 3 | 4 | 5;
 };
 
 /**
@@ -295,7 +297,7 @@ export type ScanMark = {
  * hardcoded number, so the two can never drift out of step the way a
  * duplicated literal invites.
  */
-export const SCAN_VERSION = 4 as const;
+export const SCAN_VERSION = 5 as const;
 
 /** `tool:sessionId` -> what has already been sent for it. */
 export type ScanMarks = Record<string, ScanMark>;
@@ -1402,7 +1404,7 @@ export async function fetchWithDeadline<T>(
 
 /** Stop this scan's remaining uploads when an origin or credential is unavailable. */
 export const uploadUnavailable = (error: unknown) => error instanceof ApiError &&
-  (error.status === undefined || error.status === 429 || error.status >= 500);
+  (error.status === undefined || error.status === 410 || error.status === 429 || error.status >= 500);
 
 
 /**

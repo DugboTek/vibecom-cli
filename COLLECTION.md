@@ -66,12 +66,25 @@ That is the entire payload. See `sendScanned()` in `src/core.ts`.
 `cost_usd` is derived here, on your machine, and never read from a network
 service. Transcripts record token counts and a model name but no price, so the
 CLI multiplies those counts by the published list price for that model
-(`src/pricing.ts`) — full rate for input and output, a tenth for cache reads,
-and Anthropic's TTL-dependent premium for cache writes. Claude Code states a
+(`src/pricing.ts`) — separate rates for input, output, cache reads, and cache
+writes, including the provider's model-specific discounts and TTL premiums.
+Claude Code states a
 model on every assistant message, Codex records the last request beside each
 changed cumulative total, and Kimi records usage in every agent wire. Each
 request/record is priced against the model that served it before per-model
 session slices are uploaded.
+
+Rates were verified on October 7, 2026 against the official
+[OpenAI Standard API pricing](https://developers.openai.com/api/docs/pricing),
+[Claude API pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+and [Kimi API pricing](https://platform.kimi.ai/docs/pricing/chat.md).
+Long-context premiums apply to individual requests, including cached input,
+when request boundaries are recorded. For older archives with only cumulative
+session totals, the collector uses base rates rather than assuming the whole
+session was one long request. Kimi's unspecified cache-write TTL uses its
+documented five-minute default. Unknown premium variants do not inherit a
+cheaper base model's rate. There is no flat per-task charge: a session's cost is
+the sum of its recorded token usage at these rates.
 
 It is an API-equivalent figure, not an invoice. A flat monthly subscription
 bills the same regardless, so this answers "what would this volume cost at list
@@ -185,8 +198,11 @@ top of the installer.
 
 When you opt into `vibecom autopilot on` on macOS, the CLI also installs a
 private per-user LaunchAgent that runs `vibecom scan --quiet` at the configured
-interval (thirty minutes for a new setup; `vibecom scan` refreshes immediately).
-The CLI disables its own continuous exporters while retaining the archive-upload
+interval (once a day by default; shorter legacy intervals upgrade to daily;
+`vibecom scan` refreshes immediately). A failed automatic upload preserves local
+archive watermarks and retries at the next daily attempt.
+The server rejects continuous metrics, traces, and live log deltas before
+authenticating against the database. The CLI disables its own continuous exporters while retaining the archive-upload
 credentials. This is how **Claude Code, Codex, and Kimi** all stay current when they write their normal local archives, regardless
 of which terminal app launched them. It is not a process monitor and it does
 not read the screen, terminal scrollback, or a chat transcript beyond the

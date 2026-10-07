@@ -438,8 +438,8 @@ test("codex: cost is derived from the session totals", () => {
     },
   ]);
   const u = parserFor("codex")(file, 0)!;
-  // gpt-5.6-sol is $5/M in, $30/M out.
-  assert.equal(u.costUsd, 35);
+  // Current gpt-5.6-sol is $4/M in, $20/M out. These are session totals.
+  assert.equal(u.costUsd, 24);
   assert.equal(u.unpricedTokens, 0);
 });
 
@@ -555,7 +555,7 @@ test("codex: long-context pricing is decided per request, not per session", () =
   ]);
   const parsed = parserFor("codex")(file, 0)!;
   assert.equal(parsed.inputTokens, 300_000);
-  assert.equal(parsed.costUsd, 1.5, "two 150K requests remain at the base rate");
+  assert.equal(parsed.costUsd, 1.2, "two 150K requests remain at the base rate");
 });
 
 /* ------- kimi ------- */
