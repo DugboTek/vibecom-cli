@@ -1374,6 +1374,37 @@ export class ApiError extends Error {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Bound the entire HTTP exchange, including a response body that stops arriving. */
+export async function fetchWithDeadline<T>(
+  url: string, init: RequestInit, consume: (response: Response) => Promise<T>,
+  timeoutMs = 30_000
+): Promise<T> {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) forwardAbort();
+  else init.signal?.addEventListener("abort", forwardAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fetch(url, { ...init, signal: controller.signal }).then(consume),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new ApiError(`request timed out — history is saved locally; retry when the server is available`));
+          controller.abort();
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    init.signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+/** Stop this scan's remaining uploads when an origin or credential is unavailable. */
+export const uploadUnavailable = (error: unknown) => error instanceof ApiError &&
+  (error.status === undefined || error.status === 429 || error.status >= 500);
+
+
 /**
  * Retries 429 and 5xx with backoff.
  *
@@ -1389,6 +1420,7 @@ async function request<T>(
 ): Promise<T> {
   origin = secureOrigin(origin);
   let res: Response;
+  let body: Record<string, unknown>;
   try {
     /* Manual redirects, deliberately. A host that redirects to a different
        origin — apex to www being the usual one — makes fetch strip the
@@ -1396,8 +1428,10 @@ async function request<T>(
        as "missing Bearer token" and looks like a bad credential rather than a
        misconfigured host. Following it silently would send requests somewhere
        the token was never issued for, so name the canonical host instead. */
-    res = await fetch(origin + route, { ...init, redirect: "manual" });
-  } catch {
+    ({ res, body } = await fetchWithDeadline(origin + route, { ...init, redirect: "manual" },
+      async (res) => ({ res, body: await res.json().catch(() => ({})) as Record<string, unknown> })));
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw new ApiError(`could not reach ${origin}`);
   }
 
@@ -1429,7 +1463,6 @@ async function request<T>(
     return request<T>(origin, route, init, attempt + 1);
   }
 
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
     /* The server says "invalid token", which is true and useless: it names the
        thing that failed, not the thing to do. A stored credential goes stale
@@ -1559,15 +1592,16 @@ export async function selfUpdate(
 }> {
   origin = secureOrigin(origin);
   const target = realpath(process.argv[1]);
-  let res: Response;
+  let body: string;
   try {
-    res = await fetch(origin + "/cli.js");
-  } catch {
+    body = await fetchWithDeadline(origin + "/cli.js", {}, async (res) => {
+      if (!res.ok) throw new ApiError(`HTTP ${res.status} fetching ${origin}/cli.js`, res.status);
+      return res.text();
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw new ApiError(`could not reach ${origin}`);
   }
-  if (!res.ok)
-    throw new ApiError(`HTTP ${res.status} fetching ${origin}/cli.js`, res.status);
-  const body = await res.text();
 
   if (!body.startsWith("#!/usr/bin/env node")) {
     throw new ApiError("that does not look like the CLI");

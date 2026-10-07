@@ -47,6 +47,7 @@ import {
   readScanMarks,
   sendRepoStats,
   sendScanned,
+  uploadUnavailable,
   uncoveredWorktrees,
   writeScanMarks,
   fetchAllTiers,
@@ -927,6 +928,7 @@ async function runScan(
   let sent = 0;
   let sessions = 0;
   const failed = new Set<string>();
+  const unavailableOrigins = new Set<string>();
 
   for (const [root, list] of byProject) {
     const slot = slots.find((s) => s.root === root)!;
@@ -934,7 +936,7 @@ async function runScan(
       slot.root === GLOBAL_SLOT_ROOT
         ? readGlobalToken()
         : readProjectToken(slot.root);
-    if (!token) continue;
+    if (!token || unavailableOrigins.has(slot.origin)) continue;
     /* A slot the server has revoked is consent withdrawn, not a broken file.
        Re-sending would keep asking a door that has been closed, and falling
        back to the machine-wide slot would route this project's work somewhere
@@ -986,6 +988,11 @@ async function runScan(
         }
         // one line per project, not per batch
         failed.add(`${slot.label}: ${e instanceof Error ? e.message : e}`);
+        if (uploadUnavailable(e)) unavailableOrigins.add(slot.origin);
+        // Keep unsent watermarks unchanged. One outage must not produce a
+        // retry wave for every historical batch or keep the collector alive.
+        if (uploadUnavailable(e) ||
+            (e instanceof ApiError && (e.status === 401 || e.status === 403))) break;
       }
     }
   }
@@ -996,7 +1003,7 @@ async function runScan(
      sessions. Commits land without a transcript all the time — a rebase, a
      merge, work done outside any AI tool — so gating this on transcript
      activity would leave the counters permanently stale. */
-  const repos = await sendGitStats(slots, failed, seenRoots);
+  const repos = await sendGitStats(slots, failed, seenRoots, unavailableOrigins);
 
   return {
     sent,
@@ -1064,13 +1071,14 @@ async function sendGlobalGitStats(
 async function sendGitStats(
   slots: ProjectSlot[],
   failed: Set<string>,
-  seenRoots: Set<string> = new Set()
+  seenRoots: Set<string> = new Set(),
+  unavailableOrigins: Set<string> = new Set()
 ): Promise<number> {
   let sent = 0;
   const globalSlot = slots.find((s) => s.root === GLOBAL_SLOT_ROOT);
   const projectSlots = slots.filter((s) => s.root !== GLOBAL_SLOT_ROOT);
 
-  if (globalSlot) {
+  if (globalSlot && !unavailableOrigins.has(globalSlot.origin)) {
     sent += await sendGlobalGitStats(
       globalSlot,
       new Set(projectSlots.map((s) => s.root)),
@@ -1081,7 +1089,7 @@ async function sendGitStats(
 
   for (const slot of projectSlots) {
     const token = readProjectToken(slot.root);
-    if (!token) continue;
+    if (!token || isSlotStale(slot.root) || unavailableOrigins.has(slot.origin)) continue;
 
     /* Transcript rescans import historical work, so the craft counters beside
        them must use the same lifetime scope. Applying linkedAt here made a
